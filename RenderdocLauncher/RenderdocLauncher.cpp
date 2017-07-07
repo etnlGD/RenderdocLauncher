@@ -202,6 +202,43 @@ static void InstallRenderdocIATHook()
 	pfnCreateHooks(1);
 }
 
+
+HRESULT WINAPI RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain(
+	_In_opt_ IDXGIAdapter* pAdapter,
+	D3D_DRIVER_TYPE DriverType,
+	HMODULE Software,
+	UINT Flags,
+	_In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels,
+	UINT FeatureLevels,
+	UINT SDKVersion,
+	_In_opt_ CONST DXGI_SWAP_CHAIN_DESC* pSwapChainDesc,
+	_Out_opt_ IDXGISwapChain** ppSwapChain,
+	_Out_opt_ ID3D11Device** ppDevice,
+	_Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel,
+	_Out_opt_ ID3D11DeviceContext** ppImmediateContext)
+{
+	PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN pfn = (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN) Hooked_GetProcAddress(hD3D11, "D3D11CreateDeviceAndSwapChain");
+	Software = NULL;
+	return pfn(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+}
+
+HRESULT WINAPI RENDERDOC_CreateWrappedD3D11Device(
+	_In_opt_ IDXGIAdapter* pAdapter,
+	D3D_DRIVER_TYPE DriverType,
+	HMODULE Software,
+	UINT Flags,
+	_In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels,
+	UINT FeatureLevels,
+	UINT SDKVersion,
+	_Out_opt_ ID3D11Device** ppDevice,
+	_Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel,
+	_Out_opt_ ID3D11DeviceContext** ppImmediateContext)
+{
+	PFN_D3D11_CREATE_DEVICE pfn = (PFN_D3D11_CREATE_DEVICE) Hooked_GetProcAddress(hD3D11, "D3D11CreateDevice");
+	Software = NULL;
+	return pfn(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
+}
+
 bool InitD3D11AndRenderdoc(HMODULE currentModule)
 {
 	hCurrentModule = currentModule;
@@ -221,6 +258,9 @@ bool InitD3D11AndRenderdoc(HMODULE currentModule)
 		LogDebug("Fetal error: load librarys failed.\n");
 		return false; 
 	}
+
+// 	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDeviceAndSwapChain", hCurrentModule, "RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain"));
+// 	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDevice", hCurrentModule, "RENDERDOC_CreateWrappedD3D11Device"));
 
 	sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CreateDeviceAndSwapChain", hRenderdoc, "RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain"));
 	sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CreateDevice", hRenderdoc, "RENDERDOC_CreateWrappedD3D11Device"));
