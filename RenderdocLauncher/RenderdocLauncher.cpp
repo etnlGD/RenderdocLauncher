@@ -1,4 +1,5 @@
 #include "RenderdocLauncher.h"
+#include "CommonUtils.h"
 
 #include <cstdio>
 #include <d3d11.h>
@@ -6,8 +7,11 @@
 #include "PolyHook/PolyHook.hpp"
 #include <vector>
 #include <string>
+#include <stdint.h>
+#include <map>
+#include <ShlObj.h>
 
-#define LogDebug(x) printf(x)
+static bool g_RenderdocMode = false;
 
 int WINAPI CreateDirect3D11DeviceFromDXGIDevice() { printf("CreateDirect3D11DeviceFromDXGIDevice"); return 0; }
 int WINAPI CreateDirect3D11SurfaceFromDXGISurface() { printf("CreateDirect3D11SurfaceFromDXGISurface"); return 0; }
@@ -65,22 +69,34 @@ static HMODULE hD3D11 = 0;
 static HMODULE hCurrentModule = 0;
 static HMODULE hRenderdoc = 0;
 static HMODULE hDXGI = 0;
+static std::wstring g_HookedProcessName;
 
 struct DetourHookInfo
 {
 public:
 	HMODULE hTargetModule;
 	LPCSTR  sTargetFunc;
-	HMODULE hSourceModule;
-	LPCSTR  sSourceFunc;
+	FARPROC m_pSourceFunc;
 	PLH::Detour* m_pDetour;
 	bool m_bInstalledHook;
 
 public:
-	DetourHookInfo(HMODULE targetModule, LPCSTR targetFunc, HMODULE sourceModule, LPCSTR sourceFunc = NULL) :
+	DetourHookInfo(HMODULE targetModule, LPCSTR targetFunc, 
+				   HMODULE sourceModule, LPCSTR sourceFunc = NULL) :
 		hTargetModule(targetModule), sTargetFunc(targetFunc),
-		hSourceModule(sourceModule), sSourceFunc(sourceFunc ? sourceFunc : targetFunc),
 		m_pDetour(new PLH::Detour), m_bInstalledHook(false)
+	{
+		if (sourceFunc == NULL)
+			sourceFunc = targetFunc;
+
+		m_pSourceFunc = (FARPROC)GetProcAddress(sourceModule, sourceFunc);
+	}
+
+	DetourHookInfo(HMODULE targetModule, LPCSTR targetFunc,
+				   FARPROC pSourceFunc) :
+				   hTargetModule(targetModule), sTargetFunc(targetFunc),
+				   m_pSourceFunc(pSourceFunc),
+				   m_pDetour(new PLH::Detour), m_bInstalledHook(false)
 	{
 	}
 
@@ -88,18 +104,17 @@ public:
 	{
 		if (hTargetModule == hD3D11)
 		{
-			HMODULE hModule = GetModuleHandle(NULL);
-			WCHAR moduelFilename[MAX_PATH];
-			GetModuleFileName(hModule, moduelFilename, MAX_PATH);
-
-			bool hookOverwatch = false;
-
 			if (strcmp(sTargetFunc, "D3D11CreateDevice") == 0)
 			{
 				m_pDetour->m_PreserveSize = 32;
 
 				uint8_t codeBytes[] = {
+#if 0
 					0x48, 0x83, 0xC4, 0x78, // add rsp, 78h
+#else 
+					0x4D, 0x8B, 0xC7,	// mov r8, r15
+					0x48, 0x83, 0xC4, 0x68, // add rsp, 68h
+#endif
 					0x41, 0x5F, // pop r15
 					0x41, 0x5E, // pop r14
 					0x41, 0x5D, // pop r13
@@ -119,7 +134,11 @@ public:
 				m_pDetour->m_PreserveSize = 32;
 
 				uint8_t codeBytes[] = {
+#if 0
 					0x48, 0x81, 0xC4, 0x88, 0x00, 0x00, 0x00, // add rsp, 88h
+#else
+					0x48, 0x83, 0xC4, 0x78, // add rsp, 78h
+#endif
 					0x41, 0x5F, // pop r15
 					0x41, 0x5E, // pop r14
 					0x41, 0x5D, // pop r13
@@ -140,22 +159,39 @@ public:
 	bool InstallHook()
 	{
 		uint8_t* pTargetFunc = (uint8_t*)GetProcAddress(hTargetModule, sTargetFunc);
-		uint8_t* pSourceFunc = (uint8_t*)GetProcAddress(hSourceModule, sSourceFunc);
 
-		if (pTargetFunc == NULL || pSourceFunc == NULL)
+		WCHAR targetModulePath[MAX_PATH];
+		GetModuleFileName(hTargetModule, targetModulePath, MAX_PATH);
+		if (pTargetFunc == NULL)
+		{
+			g_Logger->warn("can't find proc address of {}!{}", w2s(targetModulePath), sTargetFunc);
 			return false;
+		}
 
-		wchar_t curFile[512];
-		GetModuleFileNameW(NULL, curFile, 512);
-		std::wstring f(curFile);
-		transform(f.begin(), f.end(), f.begin(), towlower);
+		if (m_pSourceFunc == NULL)
+		{
+			return false;
+		}
 
 		// Overwatch checks top 32 bytes of these functions, so do some hack.
-		if (f.find(L"overwatch.exe") != std::wstring::npos)
+		if (g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos)
 			HackOverwatch();
 		
-		m_pDetour->SetupHook(pTargetFunc, pSourceFunc);
+		m_pDetour->SetupHook(pTargetFunc, (uint8_t*) m_pSourceFunc);
 		m_bInstalledHook = m_pDetour->Hook();
+		if (!m_bInstalledHook)
+		{
+			g_Logger->warn("Detour function {}!{} from {:p} to {:p} failed",
+						   w2s(targetModulePath), sTargetFunc, 
+						   (void*) pTargetFunc, (void*) m_pSourceFunc);
+		}
+		else
+		{
+			g_Logger->debug("Detour function {}!{} from {:p} to {:p} succeed",
+						    w2s(targetModulePath), sTargetFunc,
+						    (void*)pTargetFunc, (void*)m_pSourceFunc);
+		}
+
 		return m_bInstalledHook;
 	}
 
@@ -185,25 +221,172 @@ static FARPROC WINAPI Hooked_GetProcAddress(_In_ HMODULE hModule, _In_ LPCSTR lp
 	return GetProcAddress(hModule, lpProcName);
 }
 
-static void InstallRenderdocIATHook()
+static bool InstallRenderdocIATHook()
 {
 	// 保证 Renderdoc 始终调用真正的 d3d11 API
 	pGetProcAddressHook = new PLH::IATHook;
 	pGetProcAddressHook->SetupHook("kernel32.dll", "GetProcAddress",
-									(uint8_t*)&Hooked_GetProcAddress, "renderdoc.dll");
+								   (uint8_t*)&Hooked_GetProcAddress, "renderdoc.dll");
 	if (pGetProcAddressHook->Hook())
-		LogDebug("Hook renderdoc.dll GetProcAddress failed.\n");
+	{
+		g_Logger->error("Hook renderdoc.dll GetProcAddress failed");
+		return false;
+	}
 
 	typedef void (__cdecl *tRENDERDOC_CreateHooks) (UINT Flags);
 
 	tRENDERDOC_CreateHooks pfnCreateHooks = 
 		(tRENDERDOC_CreateHooks) GetProcAddress(hRenderdoc, "RENDERDOC_CreateHooks");
 
-	pfnCreateHooks(1);
+	if (pfnCreateHooks == NULL)
+	{
+		g_Logger->error("GetProcAddress: RENDERDOC_CreateHooks failed, are you using official renderdoc ?");
+		return false;
+	}
+	else
+	{
+		pfnCreateHooks(1);
+	}
+
+	return true;
 }
 
+std::map<ID3D11DeviceContext*, PLH::Detour*> ContextUsingDetours;
+std::vector<PLH::Detour*> AllDrawIndexedDetours;
+typedef void (STDMETHODCALLTYPE *tDrawIndexed) (ID3D11DeviceContext* pContext, UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
+typedef void (STDMETHODCALLTYPE *tOMSetDepthStencilState) (ID3D11DeviceContext* pContext, ID3D11DepthStencilState *pDepthStencilState, UINT StencilRef);
+typedef void (STDMETHODCALLTYPE *tSetPredication) (ID3D11DeviceContext* pContext, ID3D11Predicate *pPredicate, BOOL PredicateValue);
 
-HRESULT WINAPI RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain(
+static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext);
+
+static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext, 
+		UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation)
+{
+	bool isOutlinePass = false;
+	UINT stencilRef = 0;
+	ID3D11DepthStencilState* pDepthStencilState = NULL;
+
+	if (g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos)
+	{
+		pContext->OMGetDepthStencilState(&pDepthStencilState, &stencilRef);
+		if (pDepthStencilState != NULL && stencilRef == 0x10)
+		{
+			D3D11_DEPTH_STENCIL_DESC Desc;
+			pDepthStencilState->GetDesc(&Desc);
+			if (Desc.DepthEnable == TRUE && Desc.DepthFunc == D3D11_COMPARISON_LESS_EQUAL &&
+				Desc.StencilEnable == TRUE && Desc.StencilWriteMask == 0x10 &&
+				Desc.StencilReadMask == 0x00 &&
+				Desc.FrontFace.StencilFunc == D3D11_COMPARISON_ALWAYS &&
+				Desc.BackFace.StencilFunc == D3D11_COMPARISON_ALWAYS)
+			{
+				isOutlinePass = true;
+
+				Desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+
+				ID3D11Device* pDevice;
+				ID3D11DepthStencilState* pHackedDepthStencilState;
+				pContext->GetDevice(&pDevice);
+				pDevice->CreateDepthStencilState(&Desc, &pHackedDepthStencilState);
+
+				pContext->OMSetDepthStencilState(pHackedDepthStencilState, stencilRef);
+
+				pHackedDepthStencilState->Release();
+				pDevice->Release();
+			}
+		}
+	}
+	
+	auto itContext = ContextUsingDetours.find(pContext);
+	if (itContext == ContextUsingDetours.end())
+	{
+		HookD3D11DeviceContext(pContext);
+		itContext = ContextUsingDetours.find(pContext);
+	}
+
+	tDrawIndexed pfnOriginalDrawIndexed = itContext->second->GetOriginal<tDrawIndexed>();
+	pfnOriginalDrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+
+	// restore depth stencil state.
+	if (isOutlinePass)
+		pContext->OMSetDepthStencilState(pDepthStencilState, stencilRef);
+
+	if (pDepthStencilState != NULL)
+		pDepthStencilState->Release();
+}
+
+static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext)
+{
+	if (ContextUsingDetours.find(pContext) == ContextUsingDetours.end())
+	{
+		const int DrawIndexed_VTABLE_INDEX = 12;
+		uint8_t** vtable = *((uint8_t***)pContext);
+		uint8_t* pSourceFunc = vtable[DrawIndexed_VTABLE_INDEX];
+		for (auto it = AllDrawIndexedDetours.begin(); it != AllDrawIndexedDetours.end(); ++it)
+		{
+			if ((*it)->GetSourcePtr<uint8_t*>() == pSourceFunc)
+			{
+				// already hooked for other instance.
+				ContextUsingDetours[pContext] = *it;
+				pContext->AddRef();
+				return;
+			}
+		}
+
+		PLH::Detour* DrawIndexedDetour = new PLH::Detour;
+		DrawIndexedDetour->m_PreserveSize = 32;
+		uint8_t codeBytes[] = {
+#if 0
+#else
+			0x48, 0x8B, 0x5C, 0x24, 0x30,		// mov rbx,qword ptr [rsp+30h]
+			0x48, 0x8B, 0x6C, 0x24, 0x38,		// mov rbp,qword ptr [rsp+38h]  
+			0x48, 0x8B, 0x74, 0x24, 0x40,		// mov rsi,qword ptr [rsp+40h]
+			0x48, 0x8B, 0x7C, 0x24, 0x48,		// mov rdi,qword ptr [rsp+48h]
+			0x48, 0x83, 0xC4, 0x20,				// add rsp, 20h
+			0x41, 0x5E,							// pop r14
+#endif
+		};
+
+		DrawIndexedDetour->m_RestoreCode = new uint8_t[sizeof(codeBytes)];
+		memcpy(DrawIndexedDetour->m_RestoreCode, codeBytes, sizeof(codeBytes));
+		DrawIndexedDetour->m_RestoreCodeSize = sizeof(codeBytes);
+
+		DrawIndexedDetour->SetupHook(pSourceFunc, (uint8_t*) &Hooked_DrawIndexed);
+		if (!DrawIndexedDetour->Hook())
+		{
+			g_Logger->warn("Detour virtual function {} at {:p} for object {:p} failed",
+						   "ID3D11DeviceContext::DrawIndex", pSourceFunc, (void*) pContext);
+		}
+		else
+		{
+			g_Logger->debug("Detour virtual function {} at {:p} for object {:p} succeed",
+						    "ID3D11DeviceContext::DrawIndex", pSourceFunc, (void*)pContext);
+		}
+
+		ContextUsingDetours[pContext] = DrawIndexedDetour;
+		pContext->AddRef();
+
+		AllDrawIndexedDetours.push_back(DrawIndexedDetour);
+	}
+}
+
+static void HookD3D11Device(ID3D11Device** ppDevice)
+{
+	if (ppDevice == NULL || *ppDevice == NULL)
+		return;
+
+	ID3D11DeviceContext* pContext;
+	(*ppDevice)->GetImmediateContext(&pContext);
+	if (pContext == NULL)
+	{
+		g_Logger->warn("GetImmediateContext from device {} returns null", (void*) ppDevice);
+		return;
+	}
+
+	HookD3D11DeviceContext(pContext);
+	pContext->Release();
+}
+
+HRESULT WINAPI CreateDerivedD3D11DeviceAndSwapChain(
 	_In_opt_ IDXGIAdapter* pAdapter,
 	D3D_DRIVER_TYPE DriverType,
 	HMODULE Software,
@@ -217,12 +400,59 @@ HRESULT WINAPI RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain(
 	_Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel,
 	_Out_opt_ ID3D11DeviceContext** ppImmediateContext)
 {
+	g_Logger->info("{:*^50}", "D3D11CreateDeviceAndSwapChain");
+	g_Logger->info("pAdater: {}", (void*) pAdapter);
+	g_Logger->info("DriverType: {}", (UINT)DriverType);
+	g_Logger->info("Software: {}", (void*) Software);
+	g_Logger->info("Flags: {}", Flags);
+	g_Logger->info("pFeatureLevels: {}", pFeatureLevels && FeatureLevels > 0 ? (UINT) pFeatureLevels[0] : 0);
+	g_Logger->info("FeatureLevels: {}", FeatureLevels);
+	g_Logger->info("SDKVersion: {}", SDKVersion);
+	g_Logger->info("pSwapChainDesc: {}", (void*) pSwapChainDesc);
+	if (pSwapChainDesc)
+	{
+		DXGI_MODE_DESC b = pSwapChainDesc->BufferDesc;
+		g_Logger->info("\t\tWidth: {}, Height: {}, RefreshDenomiator: {}, RefreshNumerator: {}, "
+					   "Format: {}, ScanlineOrdering: {}, Scaling: {}",
+					   b.Width, b.Height, b.RefreshRate.Denominator, b.RefreshRate.Numerator,
+					   (UINT) b.Format, (UINT) b.ScanlineOrdering, (UINT) b.Scaling);
+
+		g_Logger->info("\t\tSampleQuality: {}, SampleCount: {}, BufferUsage: {}, BufferCount: {}, "
+					   "OutputWindow: {}, Windowed: {}, SwapEffect: {}, Flags: {}",
+					   pSwapChainDesc->SampleDesc.Quality, pSwapChainDesc->SampleDesc.Count,
+					   (UINT) pSwapChainDesc->BufferUsage, pSwapChainDesc->BufferCount, 
+					   (void*) pSwapChainDesc->OutputWindow, pSwapChainDesc->Windowed, 
+					   (UINT) pSwapChainDesc->SwapEffect, pSwapChainDesc->Flags);
+	}
+	g_Logger->info("ppSwapChain: {}", (void*) ppSwapChain);
+	g_Logger->info("ppDevice: {}", (void*) ppDevice);
+	g_Logger->info("pFeatureLevel: {}", (void*) pFeatureLevel);
+	g_Logger->info("ppImmediateContext: {}", (void*) ppImmediateContext);
+	g_Logger->info("{:*^50}", "");
+
 	PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN pfn = (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN) Hooked_GetProcAddress(hD3D11, "D3D11CreateDeviceAndSwapChain");
-	Software = NULL;
-	return pfn(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+	D3D_FEATURE_LEVEL selected;
+	HRESULT res = pfn(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, pSwapChainDesc, 
+					  ppSwapChain, ppDevice, &selected, ppImmediateContext);
+
+	if (SUCCEEDED(res))
+	{
+		g_Logger->debug("D3D11CreateDeviceAndSwapChain succeed with feature level {}", selected);
+	}
+	else
+	{
+		g_Logger->warn("D3D11CreateDeviceAndSwapChain failed with retcode {}", res);
+	}
+
+
+	if (pFeatureLevel)
+		*pFeatureLevel = selected;
+
+	HookD3D11Device(ppDevice);
+	return res;
 }
 
-HRESULT WINAPI RENDERDOC_CreateWrappedD3D11Device(
+HRESULT WINAPI CreateDerivedD3D11Device(
 	_In_opt_ IDXGIAdapter* pAdapter,
 	D3D_DRIVER_TYPE DriverType,
 	HMODULE Software,
@@ -234,41 +464,95 @@ HRESULT WINAPI RENDERDOC_CreateWrappedD3D11Device(
 	_Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel,
 	_Out_opt_ ID3D11DeviceContext** ppImmediateContext)
 {
-	PFN_D3D11_CREATE_DEVICE pfn = (PFN_D3D11_CREATE_DEVICE) Hooked_GetProcAddress(hD3D11, "D3D11CreateDevice");
-	Software = NULL;
-	return pfn(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
+	return CreateDerivedD3D11DeviceAndSwapChain(pAdapter, DriverType, Software, Flags,
+												pFeatureLevels, FeatureLevels, SDKVersion,
+												NULL, NULL, ppDevice, pFeatureLevel, 
+												ppImmediateContext);
 }
+
+std::wstring GetLoggerFilename()
+{
+	char filename[128];
+	{
+		time_t timer;
+		time(&timer);
+
+		struct tm tm_info;
+		localtime_s(&tm_info, &timer);
+
+		strftime(filename, 128, "RDL_log_%Y.%m.%d_%H.%M.%S.log", &tm_info);
+	}
+
+	WCHAR DocumentPath[MAX_PATH];
+	SHGetFolderPath(NULL, CSIDL_MYDOCUMENTS, NULL, SHGFP_TYPE_CURRENT, DocumentPath);
+
+	return std::wstring(DocumentPath) + s2w(std::string(filename));
+}
+
 
 bool InitD3D11AndRenderdoc(HMODULE currentModule)
 {
+	g_Logger = spdlog::basic_logger_mt("logger", GetLoggerFilename());
+	spdlog::set_level(spdlog::level::debug);
+
 	hCurrentModule = currentModule;
 
+	{
+		WCHAR curFile[MAX_PATH];
+		GetModuleFileName(NULL, curFile, MAX_PATH);
+		std::wstring f(curFile);
+		g_Logger->info("Hooked into process {}", w2s(f));
+
+		transform(f.begin(), f.end(), f.begin(), towlower);
+		g_HookedProcessName = f;
+	}
+	
 	WCHAR fullPath[MAX_PATH];
 	UINT ret = GetSystemDirectoryW(fullPath, MAX_PATH);
-	if (ret != 0 && ret < MAX_PATH) 
+	if (ret != 0 && ret < MAX_PATH)
 	{
 		wcscat_s(fullPath, MAX_PATH, L"\\d3d11.dll");
 		hD3D11 = LoadLibraryEx(fullPath, NULL, 0);
 	}
 
-	hRenderdoc =  LoadLibrary(L"renderdoc.dll");
-	hDXGI =  LoadLibrary(L"dxgi.dll");
-	if (hD3D11 == NULL || hRenderdoc == NULL || hDXGI == NULL)
+	hDXGI = LoadLibrary(L"dxgi.dll");
+	if (hD3D11 == NULL || hDXGI == NULL)
 	{
-		LogDebug("Fetal error: load librarys failed.\n");
-		return false; 
+		g_Logger->error("load librarys {} and dxgi.dll failed.\n", w2s(fullPath));
+		return false;
 	}
 
-// 	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDeviceAndSwapChain", hCurrentModule, "RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain"));
-// 	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDevice", hCurrentModule, "RENDERDOC_CreateWrappedD3D11Device"));
+	if (g_RenderdocMode)
+	{
+		hRenderdoc = LoadLibrary(L"renderdoc.dll");
+		if (hRenderdoc == NULL)
+		{
+			g_Logger->error("load renderdoc.dll failed.\n");
+			return false;
+		}
+	}
 
-	sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CreateDeviceAndSwapChain", hRenderdoc, "RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain"));
-	sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CreateDevice", hRenderdoc, "RENDERDOC_CreateWrappedD3D11Device"));
-	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDeviceAndSwapChain", hRenderdoc, "RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain"));
-	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDevice", hRenderdoc, "RENDERDOC_CreateWrappedD3D11Device"));
-	sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory", hRenderdoc, "RENDERDOC_CreateWrappedDXGIFactory"));
-	sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory1", hRenderdoc, "RENDERDOC_CreateWrappedDXGIFactory1"));
-	sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory2", hRenderdoc, "RENDERDOC_CreateWrappedDXGIFactory2"));
+	// 	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDeviceAndSwapChain", hCurrentModule, "RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain"));
+	// 	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDevice", hCurrentModule, "RENDERDOC_CreateWrappedD3D11Device"));
+
+	if (hRenderdoc != NULL)
+	{
+		sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CreateDeviceAndSwapChain", hRenderdoc, "RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain"));
+		sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CreateDevice", hRenderdoc, "RENDERDOC_CreateWrappedD3D11Device"));
+		sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDeviceAndSwapChain", hRenderdoc, "RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain"));
+		sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDevice", hRenderdoc, "RENDERDOC_CreateWrappedD3D11Device"));
+		sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory", hRenderdoc, "RENDERDOC_CreateWrappedDXGIFactory"));
+		sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory1", hRenderdoc, "RENDERDOC_CreateWrappedDXGIFactory1"));
+		sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory2", hRenderdoc, "RENDERDOC_CreateWrappedDXGIFactory2"));
+	}
+	else
+	{
+		sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CreateDeviceAndSwapChain", (FARPROC)&CreateDerivedD3D11DeviceAndSwapChain));
+		sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CreateDevice", (FARPROC)&CreateDerivedD3D11Device));
+		sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDeviceAndSwapChain", (FARPROC)&CreateDerivedD3D11DeviceAndSwapChain));
+		sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDevice", (FARPROC)&CreateDerivedD3D11Device));
+	}
+
 	sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "CreateDirect3D11DeviceFromDXGIDevice", hD3D11));
 	sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "CreateDirect3D11SurfaceFromDXGISurface", hD3D11));
 	sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CoreCreateDevice", hD3D11));
@@ -324,7 +608,11 @@ bool InitD3D11AndRenderdoc(HMODULE currentModule)
 		it->InstallHook();
 	}
 
-	InstallRenderdocIATHook();
+	if (g_RenderdocMode)
+	{
+		InstallRenderdocIATHook();
+		return false;
+	}
 
 	return true;
 }
