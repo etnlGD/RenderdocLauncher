@@ -14,8 +14,9 @@
 
 #undef min
 #include <asmjit/asmjit.h>
+#include "AutoAimAnalyzer.h"
 
-static bool g_RenderdocMode = false;
+static bool g_RenderdocMode = true;
 static bool g_DebugMode = false;
 
 static asmjit::JitRuntime* g_JIT;         // Runtime specialized for JIT code execution.
@@ -406,6 +407,19 @@ x86_reg GetUnifiedReg(cs_x86* x86, int regId)
 	return X86_REG_INVALID;
 }
 
+static void LogInstructionDetail(spdlog::level::level_enum level, cs_insn* pInsn)
+{
+	char bytes[64];
+	for (int i = 0; i < pInsn->size; ++i)
+	{
+		sprintf_s(&bytes[i * 3], 4, "%02X ", (uint32_t)pInsn->bytes[i]);
+	}
+	bytes[pInsn->size * 3] = '\0';
+
+	g_Logger->debug("\t{:<16p} {:<48} {:<8} {}",
+				    (void*) pInsn->address, bytes, pInsn->mnemonic, pInsn->op_str);
+}
+
 static bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize, 
 								uint8_t** ppRestoreCode, uint32_t* pRestoreCodeSize)
 {
@@ -417,12 +431,14 @@ static bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 		return false;
 	}
 
+	g_Logger->debug("{:*^128}", "Generating Restore Code");
 	cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 
 	size_t size = codeSize + 16 - 1;
 	const uint8_t* pCode = pFuncAddr;
 	uint64_t pAddr = (uint64_t)pFuncAddr;
 
+	g_Logger->debug("Original function prologue: ");
 	cs_insn* pInstructions;
 	size_t count = cs_disasm(handle, pCode, size, pAddr, 0, &pInstructions);
 	size_t effectiveInsnCount;
@@ -431,6 +447,7 @@ static bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 		if (codeSize <= 0)
 			break;
 		codeSize -= pInstructions[effectiveInsnCount].size;
+		LogInstructionDetail(spdlog::level::debug, &pInstructions[effectiveInsnCount]);
 	}
 
 	// 1. 对栈上数据的修改都不用撤销（除了第四个函数参数之后的参数，得确定下是否有可能直接修改栈上参数）
@@ -512,7 +529,11 @@ static bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 				{
 					if (ops[0].mem.segment == X86_REG_INVALID && ops[0].mem.index == X86_REG_INVALID)
 					{
-						int64_t stackPos = (memBase == X86_REG_RSP ? curRSP : curRBP) + ops[0].mem.disp;
+						int64_t stackPos;
+						if (memBase == X86_REG_RSP)
+							stackPos = curRSP + ops[0].mem.disp;
+						else
+							stackPos = curRBP + ops[0].mem.disp - curRSP;
 
 						// mov ops[1].reg, [rsp + stackPos]
 
@@ -581,6 +602,7 @@ static bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 	count = cs_disasm(handle, (uint8_t*)pfnVoidFunc, *pRestoreCodeSize, 
 					  (uint64_t)pfnVoidFunc, 0, &pInstructions);
 
+	g_Logger->debug("Generated function epilogue: ");
 	*ppRestoreCode = new uint8_t[*pRestoreCodeSize];
 	for (size_t i = 0, codeOff = 0; i < count; ++i)
 	{
@@ -589,9 +611,13 @@ static bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 		// no rip related instructions, so we can do the copy safely.
 		memcpy((*ppRestoreCode) + codeOff, pInstructions[idx].bytes, pInstructions[idx].size);
 		codeOff += pInstructions[idx].size;
+
+		LogInstructionDetail(spdlog::level::debug, &pInstructions[idx]);
 	}
 	cs_free(pInstructions, count);
 	g_JIT->release(pfnVoidFunc);
+
+	g_Logger->debug("{:*^128}", "");
 
 	return true;
 }
@@ -633,18 +659,14 @@ public:
 
 	void HackOverwatch(uint8_t* pTargetFunc)
 	{
-		if (hTargetModule == hD3D11)
+		if (hTargetModule == hD3D11 || hTargetModule == hDXGI)
 		{
-			if (strcmp(sTargetFunc, "D3D11CreateDevice") == 0 || 
-				strcmp(sTargetFunc, "D3D11CreateDeviceAndSwapChain") == 0)
-			{
-				uint8_t* restoreCode;
-				uint32_t restoreCodeSize;
-				GenerateRestoreCode(pTargetFunc, 32, &restoreCode, &restoreCodeSize);
-				m_pDetour->m_PreserveSize = 32;
-				m_pDetour->m_RestoreCode = restoreCode;
-				m_pDetour->m_RestoreCodeSize = restoreCodeSize;
-			}
+			uint8_t* restoreCode;
+			uint32_t restoreCodeSize;
+			GenerateRestoreCode(pTargetFunc, 32, &restoreCode, &restoreCodeSize);
+			m_pDetour->m_PreserveSize = 32;
+			m_pDetour->m_RestoreCode = restoreCode;
+			m_pDetour->m_RestoreCodeSize = restoreCodeSize;
 		}
 	}
 
@@ -719,7 +741,7 @@ static bool InstallRenderdocIATHook()
 	pGetProcAddressHook = new PLH::IATHook;
 	pGetProcAddressHook->SetupHook("kernel32.dll", "GetProcAddress",
 								   (uint8_t*)&Hooked_GetProcAddress, "renderdoc.dll");
-	if (pGetProcAddressHook->Hook())
+	if (!pGetProcAddressHook->Hook())
 	{
 		g_Logger->error("Hook renderdoc.dll GetProcAddress failed");
 		return false;
@@ -815,7 +837,7 @@ static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext)
 		uint8_t* pSourceFunc = vtable[DrawIndexed_VTABLE_INDEX];
 		for (auto it = AllDrawIndexedDetours.begin(); it != AllDrawIndexedDetours.end(); ++it)
 		{
-			if ((*it)->GetSourcePtr<uint8_t*>() == pSourceFunc)
+			if ((*it)->GetSourcePtr() == pSourceFunc)
 			{
 				// already hooked for other instance.
 				ContextUsingDetours[pContext] = *it;
@@ -971,6 +993,7 @@ void initGlobalLog()
 
 	g_Logger = spdlog::basic_logger_mt("logger", logDir + s2w(filename));
 	spdlog::set_level(spdlog::level::debug);
+	g_Logger->flush_on(spdlog::level::debug);
 }
 
 bool InitD3D11AndRenderdoc(HMODULE currentModule)
@@ -1015,9 +1038,6 @@ bool InitD3D11AndRenderdoc(HMODULE currentModule)
 			return false;
 		}
 	}
-
-	// 	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDeviceAndSwapChain", hCurrentModule, "RENDERDOC_CreateWrappedD3D11DeviceAndSwapChain"));
-	// 	sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDevice", hCurrentModule, "RENDERDOC_CreateWrappedD3D11Device"));
 
 	if (hRenderdoc != NULL)
 	{
@@ -1092,9 +1112,8 @@ bool InitD3D11AndRenderdoc(HMODULE currentModule)
 		it->InstallHook();
 	}
 
-	if (g_RenderdocMode)
+	if (g_RenderdocMode && !InstallRenderdocIATHook())
 	{
-		InstallRenderdocIATHook();
 		return false;
 	}
 

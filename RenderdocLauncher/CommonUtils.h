@@ -10,3 +10,7 @@ std::string w2s(const std::wstring& s);
 #include <spdlog/spdlog.h>		// log
 extern std::shared_ptr<spdlog::logger> g_Logger;
 
+
+#ifndef SAFE_RELEASE
+#define SAFE_RELEASE(p) { if (p) { (p)->Release(); (p) = nullptr; } }
+#endif

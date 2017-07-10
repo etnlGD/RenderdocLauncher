@@ -133,7 +133,7 @@
       <Optimization>Disabled</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;RENDERDOCLAUNCHER_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>ASMJIT_STATIC;WIN32;NDEBUG;_WINDOWS;_USRDLL;RENDERDOCLAUNCHER_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <AdditionalIncludeDirectories>$(SolutionDir)\PolyHook;$(SolutionDir)\PolyHook\Capstone\include;$(SolutionDir)\spdlog\include;$(SolutionDir)\asmjit\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeaderFile />
@@ -151,7 +151,7 @@
     </Link>
     <PostBuildEvent>
       <Command>copy /Y $(TargetPath) F:\zhurong\program\bin\Release64\d3d11.dll
-copy /Y $(SolutionDir)\asmjit\build_vs2013_x64\Release\asmjit.dll F:\zhurong\program\bin\Release64\asmjit.dll
+
 
 </Command>
     </PostBuildEvent>
@@ -160,10 +160,12 @@ copy /Y $(SolutionDir)\asmjit\build_vs2013_x64\Release\asmjit.dll F:\zhurong\pro
     <Text Include="ReadMe.txt" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AutoAimAnalyzer.h" />
     <ClInclude Include="CommonUtils.h" />
     <ClInclude Include="RenderdocLauncher.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="AutoAimAnalyzer.cpp" />
     <ClCompile Include="CommonUtils.cpp" />
     <ClCompile Include="dllmain.cpp">
       <CompileAsManaged Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">false</CompileAsManaged>
