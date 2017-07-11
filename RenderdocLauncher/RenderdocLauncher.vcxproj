@@ -148,6 +148,7 @@
       <ModuleDefinitionFile>D3D11.def</ModuleDefinitionFile>
       <AdditionalLibraryDirectories>$(SolutionDir)\PolyHook\capstone\msvc\x64\Release;$(SolutionDir)\asmjit\build_vs2013_x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>asmjit.lib;capstone.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <IgnoreSpecificDefaultLibraries>libcmt.lib;</IgnoreSpecificDefaultLibraries>
     </Link>
     <PostBuildEvent>
       <Command>copy /Y $(TargetPath) F:\zhurong\program\bin\Release64\d3d11.dll
@@ -160,13 +161,22 @@
     <Text Include="ReadMe.txt" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AsmCommon.h" />
     <ClInclude Include="AutoAimAnalyzer.h" />
     <ClInclude Include="CommonUtils.h" />
+    <ClInclude Include="DeviceContextState.h" />
+    <ClInclude Include="HookUtil.h" />
     <ClInclude Include="RenderdocLauncher.h" />
+    <ClInclude Include="shader_obj\DrawTargetPS.h" />
+    <ClInclude Include="shader_obj\DrawTargetVS.h" />
+    <ClInclude Include="VTableDetour.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="AsmCommon.cpp" />
     <ClCompile Include="AutoAimAnalyzer.cpp" />
     <ClCompile Include="CommonUtils.cpp" />
+    <ClCompile Include="D3D11Exports.cpp" />
+    <ClCompile Include="DeviceContextState.cpp" />
     <ClCompile Include="dllmain.cpp">
       <CompileAsManaged Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">false</CompileAsManaged>
       <CompileAsManaged Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</CompileAsManaged>
@@ -181,6 +191,7 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
       </PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="HookUtil.cpp" />
     <ClCompile Include="RenderdocLauncher.cpp" />
   </ItemGroup>
   <ItemGroup>

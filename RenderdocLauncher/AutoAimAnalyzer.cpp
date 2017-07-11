@@ -39,42 +39,48 @@ AutoAimAnalyzer::~AutoAimAnalyzer()
 	for (auto it = m_CachedVBData.begin(); it != m_CachedVBData.end(); ++it)
 	{
 		it->first->Release();
-		SAFE_RELEASE(it->second.pStageVB);
+		SAFE_RELEASE(it->second.pStageBuffer);
 	}
-	m_CachedVBData.clear();
 }
 
-void AutoAimAnalyzer::OnDrawEnemyPart(UINT indexCount)
+void AutoAimAnalyzer::OnDrawEnemyPart(UINT indexCount, UINT startIndex, UINT baseVertex)
 {
-	ID3D11Buffer* pObjectCB;
-	m_pContext->VSGetConstantBuffers(7, 1, &pObjectCB);
-	if (pObjectCB == NULL)
-	{
-		g_Logger->warn("AutoAimAnalyzer: Object CB not set");
-		return;
-	}
+	SDrawData d;
+	d.indexCount = indexCount;
+	d.startIndex = startIndex;
+	d.baseVertex = baseVertex;
 
-	ID3D11Buffer* pPosAndSkinVB;
-	UINT stride, offset;
-	m_pContext->IAGetVertexBuffers(0, 1, &pPosAndSkinVB, &stride, &offset);
-	if (pPosAndSkinVB == NULL || stride != OBJECT_VB_STRIDE || offset != 0)
+	ID3D11Buffer *pObjectCB, *pPosAndSkinVB, *pIndexBuffer;
+	UINT stride, vbOffset;
+
+	m_pContext->VSGetConstantBuffers(7, 1, &pObjectCB);
+	m_pContext->IAGetVertexBuffers(0, 1, &pPosAndSkinVB, &stride, &vbOffset);
+	m_pContext->IAGetIndexBuffer(&pIndexBuffer, &d.ibFormat, &d.ibOffset);
+	if (pObjectCB == NULL || pPosAndSkinVB == NULL || stride != OBJECT_VB_STRIDE || vbOffset != 0 ||
+		pIndexBuffer == NULL)
 	{
-		g_Logger->warn("AutoAimAnalyzer: vb0 is null or buffer stride or offset not match "
-					   "pBuffer {} stride {} offset {}",
-					   (void*)pPosAndSkinVB, stride, offset);
+		g_Logger->warn("AutoAimAnalyzer: current state not match "
+					   "cb7 {} vb0 {} ib {} stride {} offset {}",
+					   (void*) pObjectCB, (void*)pPosAndSkinVB, (void*) pIndexBuffer, stride, vbOffset);
 
 		SAFE_RELEASE(pObjectCB);
 		SAFE_RELEASE(pPosAndSkinVB);
+		SAFE_RELEASE(pIndexBuffer);
 		return;
 	}
 
-	ID3D11Buffer* pObjectStageCB = CopyBufferToCpu(pObjectCB);
+	d.pObjectCB = CopyBufferToCpu(pObjectCB);
+	d.pCachedVB = GetCachedBufferData(pPosAndSkinVB);
+	d.pCachedIB = GetCachedBufferData(pIndexBuffer);
 	SAFE_RELEASE(pObjectCB);
-
-	SVBCachedData* pCachedVB = GetCachedVBData(pPosAndSkinVB);
 	SAFE_RELEASE(pPosAndSkinVB);
+	SAFE_RELEASE(pIndexBuffer);
 
-	m_CurFrameDrawDatas.push_back(SDrawData{ pObjectStageCB, pCachedVB, indexCount });
+// TODO_wzq verify input layout
+// 	ID3D11InputLayout* pInputLayout;
+// 	m_pContext->IAGetInputLayout(&pInputLayout);
+
+	m_CurFrameDrawDatas.push_back(d);
 
 	if (m_pCurFrameCB == NULL)
 	{
@@ -122,38 +128,71 @@ void AutoAimAnalyzer::OnDrawEnemyPart(UINT indexCount)
 	}
 }
 
-void AutoAimAnalyzer::GetReferenceVert(const std::vector<SVBCachedData*>& pVBs, void* pRefVert)
+void AutoAimAnalyzer::GetReferenceVert(const std::vector<SDrawData>& drawcalls, void* pRefVert)
 {
 	float maxY = 0;
-	for (auto it = pVBs.begin(); it != pVBs.end(); ++it)
+	for (auto it = drawcalls.begin(); it != drawcalls.end(); ++it)
 	{
-		maxY = (std::max)(maxY, (*it)->maxY);
+		char *pRawIB, *pRawVB;
+		MapBuffer(it->pCachedIB->pStageBuffer, (void**)&pRawIB, NULL);
+		MapBuffer(it->pCachedVB->pStageBuffer, (void**)&pRawVB, NULL);
+
+		// ib format only supports uint32 and uint16
+		int ibStride = (it->ibFormat == DXGI_FORMAT_R32_UINT) ? 4 : 2;
+		for (UINT i = 0; i < it->indexCount; ++i)
+		{
+			char* ibOff = &pRawIB[(i + it->startIndex) * ibStride];
+
+			UINT vbIdx = it->baseVertex;
+			if (ibStride == 4)
+				vbIdx += *((uint32_t*) ibOff);
+			else 
+				vbIdx += *((uint16_t*) ibOff);
+
+			float* pVert = reinterpret_cast<float*>(&pRawVB[vbIdx * OBJECT_VB_STRIDE]);
+			maxY = (std::max)(maxY, pVert[1]); // pVert[1] -> pos.y
+		}
+
+		UnmapBuffer(it->pCachedIB->pStageBuffer);
+		UnmapBuffer(it->pCachedVB->pStageBuffer);
 	}
 
-#define TARGET_POS_RATIO 0.8f
+#define TARGET_POS_RATIO 0.75f
 	float targetX = 0, targetY = maxY * TARGET_POS_RATIO, targetZ = 0;
 	float minDist2ToTarget = FLT_MAX;
-	for (auto it = pVBs.begin(); it != pVBs.end(); ++it)
-	{
-		char* pData;
-		UINT byteWidth;
-		MapBuffer((*it)->pStageVB, (void**) &pData, &byteWidth);
 
-		for (UINT i = 0; i < byteWidth; i += OBJECT_VB_STRIDE)
+	for (auto it = drawcalls.begin(); it != drawcalls.end(); ++it)
+	{
+		char *pRawIB, *pRawVB;
+		MapBuffer(it->pCachedIB->pStageBuffer, (void**)&pRawIB, NULL);
+		MapBuffer(it->pCachedVB->pStageBuffer, (void**)&pRawVB, NULL);
+
+		// ib format only supports uint32 and uint16
+		int ibStride = (it->ibFormat == DXGI_FORMAT_R32_UINT) ? 4 : 2;
+		for (UINT i = 0; i < it->indexCount; ++i)
 		{
-			float* pVert = reinterpret_cast<float*>(&pData[i]);
+			char* ibOff = &pRawIB[(i + it->startIndex) * ibStride];
+
+			UINT vbIdx = it->baseVertex;
+			if (ibStride == 4)
+				vbIdx += *((uint32_t*)ibOff);
+			else
+				vbIdx += *((uint16_t*)ibOff);
+
+			float* pVert = reinterpret_cast<float*>(&pRawVB[vbIdx * OBJECT_VB_STRIDE]);
 			float dx = pVert[0] - targetX;
 			float dy = pVert[1] - targetY;
 			float dz = pVert[2] - targetZ;
 			float dist2 = dx * dx + dy * dy + dz * dz;
 			if (dist2 < minDist2ToTarget)
 			{
-				memcpy(pRefVert, &pData[i], OBJECT_VB_STRIDE);
+				memcpy(pRefVert, pVert, OBJECT_VB_STRIDE);
 				minDist2ToTarget = dist2;
 			}
 		}
 
-		UnmapBuffer((*it)->pStageVB);
+		UnmapBuffer(it->pCachedIB->pStageBuffer);
+		UnmapBuffer(it->pCachedVB->pStageBuffer);
 	}
 }
 
@@ -241,8 +280,8 @@ Vec2 AutoAimAnalyzer::TransformVertToScreenSpace(const Vec3& v, ID3D11Buffer* pO
 	Vec4 vClip = Vec4MulMat4x4(vWorldView, matProj);
 
 	Vec2 o;
-	o.x = vClip.x / vClip.w;
-	o.y = vClip.y / vClip.w;
+	o.x = vClip.x / vClip.w * 0.5f + 0.5f;
+	o.y = 1.0f - (vClip.y / vClip.w * 0.5f + 0.5f);
 	return o;
 }
 
@@ -283,17 +322,17 @@ void AutoAimAnalyzer::OnFrameEnd()
 		auto range = enemyParts.equal_range(itFirst->first);
 
 		UINT totalIndexCount = 0;
-		std::vector<SVBCachedData*> vbs;
+		std::vector<SDrawData> drawcalls;
 		for (auto it = range.first; it != range.second; ++it)
 		{
 			totalIndexCount += m_CurFrameDrawDatas[it->second].indexCount;
-			vbs.push_back(m_CurFrameDrawDatas[it->second].pCachedVB);
+			drawcalls.push_back(m_CurFrameDrawDatas[it->second]);
 		}
 
-		if (vbs.size() > 1 && totalIndexCount >= 3000)
+		if (drawcalls.size() > 1 && totalIndexCount >= 3000)
 		{ // reject enemy equipment
 			char refVertRaw[OBJECT_VB_STRIDE];
-			GetReferenceVert(vbs, refVertRaw);
+			GetReferenceVert(drawcalls, refVertRaw);
 
 			SVertData vert(refVertRaw);
 			Vec3 skinedVert = SkinVert(vert, pSkinTexBuffer, itFirst->first);
@@ -347,29 +386,14 @@ ID3D11Buffer* AutoAimAnalyzer::CopyBufferToCpu(ID3D11Buffer* pBuffer)
 	return pStageBuffer;
 }
 
-AutoAimAnalyzer::SVBCachedData* AutoAimAnalyzer::GetCachedVBData(ID3D11Buffer* pVB)
+AutoAimAnalyzer::SCachedBufferData* AutoAimAnalyzer::GetCachedBufferData(ID3D11Buffer* pVB)
 {
 	if (m_CachedVBData.find(pVB) == m_CachedVBData.end())
 	{
 		ID3D11Buffer* pStageVB = CopyBufferToCpu(pVB);
 
-		char* pData;
-		UINT byteWidth;
-		MapBuffer(pStageVB, (void**) &pData, &byteWidth);
-
-		float maxY = 0;
-		for (UINT i = 0; i < byteWidth; i += OBJECT_VB_STRIDE)
-		{
-			float* vertOff = reinterpret_cast<float*>(&pData[i]);
-			float localY = vertOff[1];
-			maxY = (std::max)(localY, maxY);
-		}
-
-		UnmapBuffer(pStageVB);
-
-		SVBCachedData cacheData;
-		cacheData.maxY = maxY;
-		cacheData.pStageVB = pStageVB;
+		SCachedBufferData cacheData;
+		cacheData.pStageBuffer = pStageVB;
 		m_CachedVBData[pVB] = cacheData;
 		pVB->AddRef();
 	}

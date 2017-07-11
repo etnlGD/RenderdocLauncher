@@ -14,3 +14,10 @@ extern std::shared_ptr<spdlog::logger> g_Logger;
 #ifndef SAFE_RELEASE
 #define SAFE_RELEASE(p) { if (p) { (p)->Release(); (p) = nullptr; } }
 #endif
+
+extern std::wstring g_HookedProcessName;
+extern bool g_DebugMode;
+extern HMODULE hD3D11;
+extern HMODULE hCurrentModule;
+extern HMODULE hRenderdoc;
+extern HMODULE hDXGI;

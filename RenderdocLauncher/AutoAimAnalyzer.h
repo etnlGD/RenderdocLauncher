@@ -22,17 +22,21 @@ struct Vec4
 class AutoAimAnalyzer
 {
 private:
-	struct SVBCachedData
+	struct SCachedBufferData
 	{
-		ID3D11Buffer* pStageVB;
-		float maxY;
+		ID3D11Buffer* pStageBuffer;
 	};
 
 	struct SDrawData
 	{
-		ID3D11Buffer*	pObjectCB;
-		SVBCachedData*  pCachedVB;
-		UINT			indexCount;
+		ID3D11Buffer*		pObjectCB;
+		SCachedBufferData*  pCachedVB;
+		SCachedBufferData*  pCachedIB;
+		DXGI_FORMAT			ibFormat;
+		UINT				ibOffset;
+		UINT				indexCount;
+		UINT				startIndex;
+		UINT				baseVertex;
 	};
 
 	struct SVertData 
@@ -49,7 +53,7 @@ public:
 
 	virtual ~AutoAimAnalyzer();
 
-	virtual void OnDrawEnemyPart(UINT indexCount);
+	virtual void OnDrawEnemyPart(UINT indexCount, UINT startIndex, UINT baseVertex);
 
 	virtual void OnFrameEnd();
 
@@ -58,13 +62,13 @@ private:
 
 	ID3D11Buffer* CopyBufferToCpu(ID3D11Buffer* pBuffer);
 
-	SVBCachedData* GetCachedVBData(ID3D11Buffer* pVB);
+	SCachedBufferData* GetCachedBufferData(ID3D11Buffer* pVB);
 
 	void MapBuffer(ID3D11Buffer* pStageBuffer, void** ppData, UINT* pByteWidth);
 
 	void UnmapBuffer(ID3D11Buffer* pStageBuffer);
 
-	void GetReferenceVert(const std::vector<SVBCachedData*>& pVBs, void* pRefVert);
+	void GetReferenceVert(const std::vector<SDrawData>& drawcalls, void* pRefVert);
 
 	Vec3 SkinVert(const SVertData& vert, float* pTexBuffer, int pTexBufferOffset);
 
@@ -77,8 +81,9 @@ private:
 	ID3D11Buffer* m_pCurFrameCB;
 	ID3D11Buffer* m_pCurFrameTexBuffer;
 	std::vector<SDrawData> m_CurFrameDrawDatas;
-	std::map<ID3D11Buffer*, SVBCachedData> m_CachedVBData;
 
 	std::vector<Vec2> m_TargetPos;
+
+	std::map<ID3D11Buffer*, SCachedBufferData> m_CachedVBData;
 };
 
