@@ -295,26 +295,40 @@ void AutoAimAnalyzer::OnFrameEnd()
 		return;
 	}
 
+	UINT skinTBSize;
+	float *pSkinTexBuffer, *pFrameCB;
+	MapBuffer(m_pCurFrameTexBuffer, (void**)&pSkinTexBuffer, &skinTBSize);
+	MapBuffer(m_pCurFrameCB, (void**)&pFrameCB, NULL);
 
-	// 1. group enemy parts into character according vb7_v16.z
+
+	// 1. group enemy parts into character according cb7_v16.z
 	std::multimap<int, int> enemyParts;
 	for (auto it = m_CurFrameDrawDatas.begin(); it != m_CurFrameDrawDatas.end(); ++it)
 	{
+		uint32_t cbSize;
 		int* pResData;
-		MapBuffer(it->pObjectCB, (void**) &pResData, NULL);
+		MapBuffer(it->pObjectCB, (void**) &pResData, &cbSize);
 
 		// tbufferOffset is unique for a character, so this can group character parts
-		int tbufferOffset = pResData[16 * 4 + 3];
+		int tbufferOffset = pResData[16 * 4 + 2];
 
 		int partIndex = (int)(it - m_CurFrameDrawDatas.begin());
-		enemyParts.insert(std::make_pair(tbufferOffset, partIndex));
+		if (tbufferOffset >= 0 && (tbufferOffset * 12) < (int) skinTBSize)
+		{
+			enemyParts.insert(std::make_pair(tbufferOffset, partIndex));
+		}
+		else
+		{
+			g_Logger->error("base skin position out of tbuffer bounds {}:", tbufferOffset);
+			for (uint32_t i = 0; (i + 15) < cbSize; i += 16)
+			{
+				float* pFloat4 = (float*)&((uint8_t*)pResData)[i];
+				g_Logger->error("\t\tv{}: {}, {}, {}, {}", i / 16, pFloat4[0], pFloat4[1], pFloat4[2], pFloat4[3]);
+			}
+		}
 
 		UnmapBuffer(it->pObjectCB);
 	}
-
-	float *pSkinTexBuffer, *pFrameCB;
-	MapBuffer(m_pCurFrameTexBuffer, (void**)&pSkinTexBuffer, NULL);
-	MapBuffer(m_pCurFrameCB, (void**)&pFrameCB, NULL);
 
 	// 2. find target pos for each enemy
 	for (auto itFirst = enemyParts.begin(); itFirst != enemyParts.end(); )
@@ -338,6 +352,7 @@ void AutoAimAnalyzer::OnFrameEnd()
 			Vec3 skinedVert = SkinVert(vert, pSkinTexBuffer, itFirst->first);
 
 			ID3D11Buffer* pObjectCB = m_CurFrameDrawDatas[itFirst->second].pObjectCB;
+
 			Vec2 targetPos = TransformVertToScreenSpace(skinedVert, pObjectCB, pFrameCB);
 			m_TargetPos.push_back(targetPos);
 		}
@@ -379,10 +394,15 @@ ID3D11Buffer* AutoAimAnalyzer::CopyBufferToCpu(ID3D11Buffer* pBuffer)
 		desc.StructureByteStride = 0;
 		desc.Usage = D3D11_USAGE_STAGING;
 
-		m_pDevice->CreateBuffer(&desc, NULL, &pStageBuffer);
+		if (FAILED(m_pDevice->CreateBuffer(&desc, NULL, &pStageBuffer)))
+		{
+			g_Logger->error("CreateBuffer failed when CopyBufferToCpu {}", CBDesc.ByteWidth);
+		}
 	}
 	
-	m_pContext->CopyResource(pStageBuffer, pBuffer);
+	if (pStageBuffer != NULL)
+		m_pContext->CopyResource(pStageBuffer, pBuffer);
+
 	return pStageBuffer;
 }
 
@@ -404,10 +424,17 @@ AutoAimAnalyzer::SCachedBufferData* AutoAimAnalyzer::GetCachedBufferData(ID3D11B
 void AutoAimAnalyzer::MapBuffer(ID3D11Buffer* pStageBuffer, void** ppData, UINT* pByteWidth)
 {
 	D3D11_MAPPED_SUBRESOURCE subRes;
-	m_pContext->Map(pStageBuffer, 0, D3D11_MAP_READ, 0, &subRes);
+	HRESULT res = m_pContext->Map(pStageBuffer, 0, D3D11_MAP_READ, 0, &subRes);
 
 	D3D11_BUFFER_DESC desc;
 	pStageBuffer->GetDesc(&desc);
+
+	if (FAILED(res))
+	{
+		g_Logger->error("Map stage buffer failed {} {} {} {} {}", 
+						(void*) pStageBuffer, desc.ByteWidth, desc.BindFlags, 
+						desc.CPUAccessFlags, desc.Usage);
+	}
 
 	*ppData = subRes.pData;
 

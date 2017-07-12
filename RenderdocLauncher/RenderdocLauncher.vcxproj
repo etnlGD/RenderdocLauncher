@@ -151,7 +151,7 @@
       <IgnoreSpecificDefaultLibraries>libcmt.lib;</IgnoreSpecificDefaultLibraries>
     </Link>
     <PostBuildEvent>
-      <Command>copy /Y $(TargetPath) F:\zhurong\program\bin\Release64\d3d11.dll</Command>
+      <Command>:copy /Y $(TargetPath) F:\zhurong\program\bin\Release64\d3d11.dll</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>

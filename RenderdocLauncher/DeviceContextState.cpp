@@ -36,12 +36,12 @@ namespace rdcboost
 
 		for (int i = 0; i < eSRVCount; ++i)
 		{
-			SAFE_RELEASE(m_VertexShaderState.m_pSamplers[i]);
-			SAFE_RELEASE(m_HullShaderState.m_pSamplers[i]);
-			SAFE_RELEASE(m_DomainShaderState.m_pSamplers[i]);
-			SAFE_RELEASE(m_GeometryShaderState.m_pSamplers[i]);
-			SAFE_RELEASE(m_PixelShaderState.m_pSamplers[i]);
-			SAFE_RELEASE(m_ComputeShaderState.m_pSamplers[i]);
+			SAFE_RELEASE(m_VertexShaderState.m_pSRViews[i]);
+			SAFE_RELEASE(m_HullShaderState.m_pSRViews[i]);
+			SAFE_RELEASE(m_DomainShaderState.m_pSRViews[i]);
+			SAFE_RELEASE(m_GeometryShaderState.m_pSRViews[i]);
+			SAFE_RELEASE(m_PixelShaderState.m_pSRViews[i]);
+			SAFE_RELEASE(m_ComputeShaderState.m_pSRViews[i]);
 		}
 
 		SAFE_RELEASE(m_VertexShaderState.m_pShader);

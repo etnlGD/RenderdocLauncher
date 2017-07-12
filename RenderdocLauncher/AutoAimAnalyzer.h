@@ -57,6 +57,8 @@ public:
 
 	virtual void OnFrameEnd();
 
+	virtual const std::vector<Vec2>& GetResult() { return m_TargetPos; }
+
 private:
 	void ClearFrameData();
 
