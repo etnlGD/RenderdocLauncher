@@ -34,6 +34,7 @@ struct VTableHook
 public:
 	int			VTableIndex;
 	uint8_t*	HookFuncPtr;
+	uint8_t*	SourceFuncPtr;
 	std::string	FuncName;
 	uint32_t	PreserveSize;
 

@@ -1,5 +1,6 @@
 #pragma once
 #include <capstone.h>
+#include "CommonUtils.h"
 
 #ifdef min
 #undef min
@@ -16,6 +17,8 @@ int GetRegSize(x86_reg input);
 const asmjit::X86Gp& ToJitReg(x86_reg input);
 
 x86_reg GetUnifiedReg(cs_x86* x86, int regId);
+
+void LogInstructionDetail(spdlog::level::level_enum level, cs_insn* pInsn);
 
 bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 						 uint8_t** ppRestoreCode, uint32_t* pRestoreCodeSize);

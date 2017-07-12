@@ -151,10 +151,7 @@
       <IgnoreSpecificDefaultLibraries>libcmt.lib;</IgnoreSpecificDefaultLibraries>
     </Link>
     <PostBuildEvent>
-      <Command>copy /Y $(TargetPath) F:\zhurong\program\bin\Release64\d3d11.dll
-
-
-</Command>
+      <Command>copy /Y $(TargetPath) F:\zhurong\program\bin\Release64\d3d11.dll</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -169,7 +166,6 @@
     <ClInclude Include="RenderdocLauncher.h" />
     <ClInclude Include="shader_obj\DrawTargetPS.h" />
     <ClInclude Include="shader_obj\DrawTargetVS.h" />
-    <ClInclude Include="VTableDetour.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="AsmCommon.cpp" />

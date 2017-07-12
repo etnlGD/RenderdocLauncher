@@ -335,7 +335,7 @@ x86_reg GetUnifiedReg(cs_x86* x86, int regId)
 	return X86_REG_INVALID;
 }
 
-static void LogInstructionDetail(spdlog::level::level_enum level, cs_insn* pInsn)
+void LogInstructionDetail(spdlog::level::level_enum level, cs_insn* pInsn)
 {
 	char bytes[64];
 	for (int i = 0; i < pInsn->size; ++i)
@@ -344,8 +344,8 @@ static void LogInstructionDetail(spdlog::level::level_enum level, cs_insn* pInsn
 	}
 	bytes[pInsn->size * 3] = '\0';
 
-	g_Logger->debug("\t{:<16p} {:<48} {:<8} {}",
-					(void*)pInsn->address, bytes, pInsn->mnemonic, pInsn->op_str);
+	g_Logger->log(level, "\t{:<16p} {:<48} {:<8} {}",
+				  (void*)pInsn->address, bytes, pInsn->mnemonic, pInsn->op_str);
 }
 
 bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,

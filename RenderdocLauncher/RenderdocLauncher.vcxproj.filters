@@ -36,9 +36,6 @@
     <ClInclude Include="DeviceContextState.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="VTableDetour.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="HookUtil.h">
       <Filter>Header Files</Filter>
     </ClInclude>

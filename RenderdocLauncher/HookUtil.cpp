@@ -120,6 +120,11 @@ void VTableHook::HookObject(void* pObject)
 
 		pDetour->SetupHook(pSourceFunc, HookFuncPtr);
 
+// 		uint32_t jmpOffset = pDetour->CalculateLength(pSourceFunc, PreserveSize);
+// 		PLH::VTableSwap* pVTableSwap = new PLH::VTableSwap;
+// 		pVTableSwap->SetupHook((uint8_t*)pObject, VTableIndex, pSourceFunc + jmpOffset);
+// 		pVTableSwap->Hook();
+
 		if (!pDetour->Hook())
 		{
 			g_Logger->warn("Detour virtual function {} @ {} from {} to {} failed",

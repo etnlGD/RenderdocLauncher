@@ -16,6 +16,9 @@
 #include "AutoAimAnalyzer.h"
 #include "shader_obj/DrawTargetVS.h"
 #include "shader_obj/DrawTargetPS.h"
+#include <set>
+
+#include "PolyHook/PolyHookTools.hpp"
 
 static bool g_RenderdocMode = false;
 extern bool g_DebugMode = false;
@@ -70,7 +73,6 @@ static bool InstallRenderdocIATHook()
 	return true;
 }
 
-// std::map<ID3D11DeviceContext*, PLH::Detour*> ContextUsingDetours;
 static VTableHook* g_DrawIndexedHook;
 
 typedef void (STDMETHODCALLTYPE *tDrawIndexed) (ID3D11DeviceContext* pContext, UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
@@ -79,15 +81,247 @@ typedef void (STDMETHODCALLTYPE *tSetPredication) (ID3D11DeviceContext* pContext
 
 static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext);
 
+static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext,
+												 UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
+
+static size_t FindPrevCall(uint8_t* pRetAddr, csh handle)
+{
+	for (size_t callInstSize = 1; callInstSize <= 16; ++callInstSize)
+	{
+		const uint8_t* pCode = (uint8_t*)pRetAddr - callInstSize;
+		cs_insn* pInstructions;
+		size_t count = cs_disasm(handle, pCode, callInstSize, (uint64_t)pCode, 0, &pInstructions);
+		if (count == 1 && pInstructions[0].size == callInstSize &&
+			strcmp(pInstructions[0].mnemonic, "call") == 0)
+		{
+			g_Logger->info("++ find call/jmp instruction before retAddr: ");
+			LogInstructionDetail(spdlog::level::info, &pInstructions[0]);
+			cs_free(pInstructions, count);
+			return callInstSize;
+		}
+		cs_free(pInstructions, count);
+	}
+
+	return 0;	// not found.
+}
+
+static void LogInstructions(uint8_t* pAddr, csh handle)
+{
+	cs_insn* pInstructions;
+	size_t count = cs_disasm(handle, pAddr, 0x100, (uint64_t)pAddr, 0, &pInstructions);
+
+	g_Logger->info("Log chunk instructions:");
+	for (size_t i = 0; i < count; ++i)
+	{
+		LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
+	}
+}
+
+std::set<void*> DrawIndexedRetAddr;
+std::set<void*> DrawIndexedTailJmps;
+static uint8_t* DetourCaller(csh* pHandle, uint8_t* pCaller, size_t callInstSize, bool tailJmp)
+{
+	csh handle;
+	if (pHandle == NULL)
+	{
+		cs_err err = cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
+		if (err != CS_ERR_OK)
+		{
+			g_Logger->error("Capstone initialize failed {}", err);
+			return NULL;
+		}
+	}
+	else
+	{
+		handle = *pHandle;
+	}
+	
+	uint8_t* pTrampoline;
+	do { // allocate trampoline
+		size_t trampolineSize = 64;
+		size_t delta;
+		pTrampoline = (uint8_t*)PLH::Tools::AllocateWithin2GB(pCaller, trampolineSize, delta);
+		if (pTrampoline == NULL)
+		{
+			g_Logger->error("Diff between pCaller({}) and Hooked_DrawIndexed({}) is too long, "
+							"and attempt to allocate within 2GB failed",
+							(void*)pCaller, (void*)&Hooked_DrawIndexed);
+
+			return NULL;
+		}
+
+		DWORD oldProtection;
+		VirtualProtect(pTrampoline, trampolineSize, PAGE_EXECUTE_READWRITE, &oldProtection);
+
+		uint8_t detour[] = {
+			0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+			0xFF, 0x15, 0xF2, 0xFF, 0xFF, 0xFF,			// call hooked function
+			0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+			0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+			0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,			// jmp back to original function
+			0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+		};
+
+		if (tailJmp)
+			detour[9] = 0x25; // change 'call' to 'jmp'
+
+		memcpy(pTrampoline, detour, sizeof(detour));
+		*(uintptr_t*)&pTrampoline[0] = (uintptr_t)&Hooked_DrawIndexed;
+
+		if (!tailJmp)
+			DrawIndexedRetAddr.insert(pTrampoline + 14);
+		else
+			DrawIndexedTailJmps.insert(pCaller);
+// 		VirtualProtect(pTrampoline, trampolineSize, oldProtection, &oldProtection);
+	} while (0);
+
+
+	do { // log call/jmp instruction
+		cs_insn* pInstructions;
+		size_t count = cs_disasm(handle, pCaller, callInstSize, (uint64_t)pCaller, 0, &pInstructions);
+		g_Logger->info("++ detour call/jmp instruction: ");
+		LogInstructionDetail(spdlog::level::info, &pInstructions[0]);
+		cs_free(pInstructions, count);
+	} while (0);
+
+
+	uint8_t jmpCode[] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
+	const size_t jmpCodeLen = sizeof(jmpCode);
+
+	// patch relative address of jmp to trampoline
+	*(int32_t*)&jmpCode[1] = (int32_t)((pTrampoline + 8) - (pCaller + jmpCodeLen));
+
+	uint8_t* pRetAddr = pCaller + callInstSize;
+
+	size_t relocSrcSize = 0;
+	if (jmpCodeLen > callInstSize)
+	{ // relocate rest affected code
+		cs_insn* pInstructions;
+		size_t count = cs_disasm(handle, (uint8_t*)pRetAddr,
+									(jmpCodeLen - callInstSize) + 16,
+									(uint64_t)pRetAddr, 0, &pInstructions);
+
+		g_Logger->info(tailJmp ? "++ override instructions" : "++ relocating instructions:");
+		for (size_t i = 0; i < count; ++i)
+		{
+			relocSrcSize += pInstructions[i].size;
+			LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
+			if ((relocSrcSize + callInstSize) >= jmpCodeLen)
+			{
+				memcpy(pTrampoline + 14, pRetAddr, relocSrcSize);
+
+				// TODO relocate these code
+				break;
+			}
+		}
+
+		cs_free(pInstructions, count);
+	}
+
+	size_t hookSrcLen = callInstSize + relocSrcSize;
+
+	// patch trampoline return address
+	*(uintptr_t*)&pTrampoline[36] = (uintptr_t)pRetAddr + relocSrcSize;
+
+	do { // change original function call
+		DWORD oldProtection;
+
+		MEMORY_BASIC_INFORMATION bi;
+		size_t queryRes = VirtualQuery(pCaller, &bi, sizeof(MEMORY_BASIC_INFORMATION));
+		g_Logger->info("VQ: {} {} {} {} {} {} {} {}", queryRes, bi.BaseAddress, bi.AllocationBase, 
+					   bi.AllocationProtect, bi.RegionSize, bi.State, bi.Protect, bi.Type);
+
+		BOOL b = VirtualProtect(pCaller, hookSrcLen, PAGE_READONLY, &oldProtection);
+
+		g_Logger->info("{} {} {} {} {}", hookSrcLen, jmpCodeLen, b, oldProtection, GetLastError());
+		memcpy(pCaller, jmpCode, jmpCodeLen);
+		g_Logger->info("1");
+
+		// fill with nop
+		for (size_t rest = jmpCodeLen; rest < hookSrcLen; ++rest)
+			pCaller[rest] = 0x90;
+		g_Logger->info("1");
+
+		VirtualProtect(pCaller, callInstSize, oldProtection, &oldProtection);
+	} while (0);
+
+	{ // log modified instructions
+		cs_insn* pInstructions;
+		size_t count = cs_disasm(handle, pCaller, hookSrcLen, (uint64_t)pCaller, 0, &pInstructions);
+		g_Logger->info("++ modified call instructions: ");
+		for (size_t i = 0; i < count; ++i)
+			LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
+		cs_free(pInstructions, count);
+	}
+
+	{ // log trampoline instructions
+		cs_insn* pInstructions;
+		size_t count = cs_disasm(handle, pTrampoline + 8, tailJmp ? 6 : 28, 
+								 (uint64_t)pTrampoline + 8, 0, &pInstructions);
+		g_Logger->info("++ generated trampoline instructions: ");
+		for (size_t i = 0; i < count; ++i)
+			LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
+		cs_free(pInstructions, count);
+	}
+
+	return pTrampoline;
+}
+
+static void DetourDrawIndexedRetAddr(void** ppRetAddr)
+{
+	void* pRetAddr = *ppRetAddr;
+
+	csh handle;
+	cs_err err = cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
+	if (err != CS_ERR_OK)
+	{
+		g_Logger->error("Capstone initialize failed {}", err);
+		return;
+	}
+
+	// find last call instruction
+	size_t callInstSize = FindPrevCall((uint8_t*)pRetAddr, handle);
+	if (callInstSize <= 0)
+	{
+		g_Logger->error("DrawIndexed: can't find call instruction before retAddr");
+		return;
+	}
+
+	uint8_t* pPrevCall = (uint8_t*)pRetAddr - callInstSize;
+	uint8_t* pTrampoline = DetourCaller(&handle, pPrevCall, callInstSize, false);
+
+	if (pTrampoline)
+		*ppRetAddr = pTrampoline + 14;
+}
+
 static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext, 
 		UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation)
 {
-	bool isOutlinePass = false;
-	UINT stencilRef = 0;
 	ID3D11DepthStencilState* pDepthStencilState = NULL;
+	UINT stencilRef = 0;
+	bool isOutlinePass = false;
+
+	void** pStack = (void**) &pContext;
+	void* pRetAddr = pStack[-1];
+	if (DrawIndexedRetAddr.find(pRetAddr) == DrawIndexedRetAddr.end())
+	{
+		g_Logger->debug("DrawIndexed Callstack RetAddr: {}", pRetAddr);
+		DrawIndexedRetAddr.insert(pRetAddr);
+
+// 		DetourDrawIndexedRetAddr(&pStack[-1]);
+	}
 
 	if (g_DebugMode || g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos)
 	{
+		static bool b = false;
+		if (b == false)
+		{
+			uint8_t* pJmpDrawIndexedAddr = (uint8_t*)pRetAddr + (0x7ff722e3b1d7 - 0x7ff722e22898 - 5);
+			if (DrawIndexedTailJmps.find(pJmpDrawIndexedAddr) == DrawIndexedTailJmps.end())
+				DetourCaller(NULL, pJmpDrawIndexedAddr, 4, true);
+			b = true;
+		}
+		
 		pContext->OMGetDepthStencilState(&pDepthStencilState, &stencilRef);
 		if (pDepthStencilState != NULL && stencilRef == 0x10)
 		{
@@ -410,6 +644,34 @@ void initGlobalLog()
 	g_Logger->flush_on(spdlog::level::debug);
 }
 
+// typedef DWORD(WINAPI *tGetModuleFileNameW)(HMODULE hModule, LPWSTR lpFilename, DWORD nSize);
+// typedef DWORD(WINAPI *tGetModuleFileNameA)(HMODULE hModule, LPSTR lpFilename, DWORD nSize);
+// 
+// DWORD WINAPI Hooked_GetModuleFileNameW(HMODULE hModule, LPWSTR lpFilename, DWORD nSize)
+// {
+// 	if (hCurrentModule == hModule)
+// 	{
+// 		hModule = hD3D11;
+// 		g_Logger->info("GetModuleFileNameW with current module");
+// 	}
+// 
+// 	HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
+// 	return ((tGetModuleFileNameW) Hooked_GetProcAddress(hKernel32, "GetModuleFileNameW"))(hModule, lpFilename, nSize);
+// }
+// 
+// DWORD WINAPI Hooked_GetModuleFileNameA(HMODULE hModule, LPSTR lpFilename, DWORD nSize)
+// {
+// 	if (hCurrentModule == hModule)
+// 	{
+// 		hModule = hD3D11;
+// 		g_Logger->info("GetModuleFileNameA with current module");
+// 	}
+// 
+// 	HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
+// 	return ((tGetModuleFileNameA)Hooked_GetProcAddress(hKernel32, "GetModuleFileNameA"))(hModule, lpFilename, nSize);
+// }
+// 
+
 bool InitD3D11AndRenderdoc(HMODULE currentModule)
 {
 	initGlobalLog();
@@ -433,6 +695,15 @@ bool InitD3D11AndRenderdoc(HMODULE currentModule)
 	if (ret != 0 && ret < MAX_PATH)
 	{
 		wcscat_s(fullPath, MAX_PATH, L"\\d3d11.dll");
+
+		{
+			HMODULE hD3D11 = GetModuleHandle(fullPath);
+			if (hD3D11 != NULL)
+			{
+				g_Logger->critical("{} has already been loaded into process", w2s(fullPath));
+			}
+		}
+
 		hD3D11 = LoadLibraryEx(fullPath, NULL, 0);
 	}
 
@@ -452,6 +723,11 @@ bool InitD3D11AndRenderdoc(HMODULE currentModule)
 			return false;
 		}
 	}
+
+// 	HMODULE hKernel32 = LoadLibrary(L"kernel32.dll");
+// 	sDetourHooks.push_back(DetourHookInfo(hKernel32, "GetModuleFileNameW", (FARPROC)&Hooked_GetModuleFileNameW));
+// 	sDetourHooks.push_back(DetourHookInfo(hKernel32, "GetModuleFileNameA", (FARPROC)&Hooked_GetModuleFileNameA));
+
 
 	if (hRenderdoc != NULL)
 	{
