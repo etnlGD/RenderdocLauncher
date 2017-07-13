@@ -70,7 +70,7 @@ private:
 
 	void UnmapBuffer(ID3D11Buffer* pStageBuffer);
 
-	void GetReferenceVert(const std::vector<SDrawData>& drawcalls, void* pRefVert);
+	bool GetReferenceVert(const std::vector<SDrawData>& drawcalls, void* pRefVert);
 
 	Vec3 SkinVert(const SVertData& vert, float* pTexBuffer, int pTexBufferOffset);
 

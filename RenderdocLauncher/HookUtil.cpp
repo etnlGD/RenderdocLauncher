@@ -142,11 +142,10 @@ void VTableHook::HookObject(void* pObject)
 
 uint8_t* VTableHook::GetOriginalPtr(void* pObject)
 {
-	if (pObject == NULL)
+	uint8_t* pSourceFunc = GetVTableFuncPtr(pObject);
+	if (pSourceFunc == NULL)
 		return NULL;
 
-	uint8_t** vtable = *((uint8_t***)pObject);
-	uint8_t* pSourceFunc = vtable[VTableIndex];
 	auto it = AllDetours.find(pSourceFunc);
 	if (it != AllDetours.end())
 	{
@@ -155,6 +154,15 @@ uint8_t* VTableHook::GetOriginalPtr(void* pObject)
 	}
 
 	return NULL;
+}
+
+uint8_t* VTableHook::GetVTableFuncPtr(void* pObject)
+{
+	if (pObject == NULL)
+		return NULL;
+
+	uint8_t** vtable = *((uint8_t***)pObject);
+	return vtable[VTableIndex];
 }
 
 void* CreateIATHook(const char* LibraryName, const char* SrcFunc, uint8_t* Dest, const char* Module)

@@ -128,9 +128,10 @@ void AutoAimAnalyzer::OnDrawEnemyPart(UINT indexCount, UINT startIndex, UINT bas
 	}
 }
 
-void AutoAimAnalyzer::GetReferenceVert(const std::vector<SDrawData>& drawcalls, void* pRefVert)
+bool AutoAimAnalyzer::GetReferenceVert(const std::vector<SDrawData>& drawcalls, void* pRefVert)
 {
-	float maxY = 0;
+	float maxY = -FLT_MAX, maxX = -FLT_MAX, maxZ = -FLT_MAX;
+	float minY = FLT_MAX, minX = FLT_MAX, minZ = FLT_MAX;
 	for (auto it = drawcalls.begin(); it != drawcalls.end(); ++it)
 	{
 		char *pRawIB, *pRawVB;
@@ -139,7 +140,9 @@ void AutoAimAnalyzer::GetReferenceVert(const std::vector<SDrawData>& drawcalls, 
 
 		// ib format only supports uint32 and uint16
 		int ibStride = (it->ibFormat == DXGI_FORMAT_R32_UINT) ? 4 : 2;
-		for (UINT i = 0; i < it->indexCount; ++i)
+
+		// optimize: only process first vert in tri
+		for (UINT i = 0; i < it->indexCount; i += 3)
 		{
 			char* ibOff = &pRawIB[(i + it->startIndex) * ibStride];
 
@@ -151,13 +154,24 @@ void AutoAimAnalyzer::GetReferenceVert(const std::vector<SDrawData>& drawcalls, 
 
 			float* pVert = reinterpret_cast<float*>(&pRawVB[vbIdx * OBJECT_VB_STRIDE]);
 			maxY = (std::max)(maxY, pVert[1]); // pVert[1] -> pos.y
+			maxX = (std::max)(maxX, pVert[0]); // pVert[0] -> pos.x
+			maxZ = (std::max)(maxZ, pVert[2]); // pVert[2] -> pos.z
+
+			minY = (std::min)(minY, pVert[1]); // pVert[1] -> pos.y
+			minX = (std::min)(minX, pVert[0]); // pVert[0] -> pos.x
+			minZ = (std::min)(minZ, pVert[2]); // pVert[2] -> pos.z
 		}
 
 		UnmapBuffer(it->pCachedIB->pStageBuffer);
 		UnmapBuffer(it->pCachedVB->pStageBuffer);
 	}
 
-#define TARGET_POS_RATIO 0.75f
+	if (maxY - minY < 0.75f || maxZ - minZ < 0.1f || maxX - minX < 0.1f) // maybe a weapon
+	{
+		return false;
+	}
+
+#define TARGET_POS_RATIO 0.9f
 	float targetX = 0, targetY = maxY * TARGET_POS_RATIO, targetZ = 0;
 	float minDist2ToTarget = FLT_MAX;
 
@@ -169,7 +183,7 @@ void AutoAimAnalyzer::GetReferenceVert(const std::vector<SDrawData>& drawcalls, 
 
 		// ib format only supports uint32 and uint16
 		int ibStride = (it->ibFormat == DXGI_FORMAT_R32_UINT) ? 4 : 2;
-		for (UINT i = 0; i < it->indexCount; ++i)
+		for (UINT i = 0; i < it->indexCount; i += 3)
 		{
 			char* ibOff = &pRawIB[(i + it->startIndex) * ibStride];
 
@@ -194,6 +208,8 @@ void AutoAimAnalyzer::GetReferenceVert(const std::vector<SDrawData>& drawcalls, 
 		UnmapBuffer(it->pCachedIB->pStageBuffer);
 		UnmapBuffer(it->pCachedVB->pStageBuffer);
 	}
+
+	return true;
 }
 
 static Vec4 Vec4MulMat4x4(const Vec4& v, float(*mat4x4)[4])
@@ -346,15 +362,16 @@ void AutoAimAnalyzer::OnFrameEnd()
 		if (drawcalls.size() > 1 && totalIndexCount >= 3000)
 		{ // reject enemy equipment
 			char refVertRaw[OBJECT_VB_STRIDE];
-			GetReferenceVert(drawcalls, refVertRaw);
+			if (GetReferenceVert(drawcalls, refVertRaw))
+			{
+				SVertData vert(refVertRaw);
+				Vec3 skinedVert = SkinVert(vert, pSkinTexBuffer, itFirst->first);
 
-			SVertData vert(refVertRaw);
-			Vec3 skinedVert = SkinVert(vert, pSkinTexBuffer, itFirst->first);
+				ID3D11Buffer* pObjectCB = m_CurFrameDrawDatas[itFirst->second].pObjectCB;
 
-			ID3D11Buffer* pObjectCB = m_CurFrameDrawDatas[itFirst->second].pObjectCB;
-
-			Vec2 targetPos = TransformVertToScreenSpace(skinedVert, pObjectCB, pFrameCB);
-			m_TargetPos.push_back(targetPos);
+				Vec2 targetPos = TransformVertToScreenSpace(skinedVert, pObjectCB, pFrameCB);
+				m_TargetPos.push_back(targetPos);
+			}
 		}
 
 		itFirst = range.second;

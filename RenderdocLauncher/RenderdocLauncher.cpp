@@ -418,21 +418,28 @@ struct SD3D11DeviceAddOn
 
 			D3D11_MAPPED_SUBRESOURCE subres;
 			HRESULT res = pContext->Map(pCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &subres);
-			memset(subres.pData, 0, CBSize);
-			size_t idx = 0;
-			for (auto it = pResult->begin(); it != pResult->end(); ++it, ++idx)
+			if (SUCCEEDED(res))
 			{
-				if (idx * 16 >= CBSize)
+				memset(subres.pData, 0, CBSize);
+				size_t idx = 0;
+				for (auto it = pResult->begin(); it != pResult->end(); ++it, ++idx)
 				{
-					g_Logger->error("Too many result found by AutoAim");
-					break;
+					if (idx * 16 >= CBSize)
+					{
+						g_Logger->error("Too many result found by AutoAim");
+						break;
+					}
+
+					((float*)subres.pData)[idx * 4 + 0] = it->x;
+					((float*)subres.pData)[idx * 4 + 1] = it->y;
 				}
-
-				((float*)subres.pData)[idx * 4 + 0] = it->x;
-				((float*)subres.pData)[idx * 4 + 1] = it->y;
+				pContext->Unmap(pCB, 0);
 			}
-			pContext->Unmap(pCB, 0);
-
+			else
+			{
+				g_Logger->error("Map CB for write failed {} {}", res, (void*) pCB);
+			}
+			
 			pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 			pContext->VSSetConstantBuffers(0, 1, &pCB);
 			pContext->VSSetShader(pVSDrawTarget, NULL, 0);
@@ -457,6 +464,12 @@ struct SD3D11DeviceAddOn
 	void OnRenderEnd(IDXGISwapChain* pSwapChain) // invoke from IDXGISwapChain::Present
 	{
 		ID3D11RenderTargetView* pRTV = GetRTVForBackbuffer(pSwapChain);
+		if (pRTV == NULL)
+		{
+			g_Logger->critical("GetRTVForBackbuffer failed {}", (void*) pSwapChain);
+			return;
+		}
+
 		OnRenderEnd(pRTV);
 	}
 };
@@ -504,9 +517,9 @@ static void STDMETHODCALLTYPE Hooked_Draw(ID3D11DeviceContext* pContext,
 static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext, 
 		UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation)
 {
-	ID3D11DepthStencilState* pDepthStencilState = NULL;
+	bool changedDS = false;
 	UINT stencilRef = 0;
-	bool isOutlinePass = false;
+	ID3D11DepthStencilState* pDepthStencilState = NULL;
 
 // 	void** pStack = (void**) &pContext;
 // 	void* pRetAddr = pStack[-1];
@@ -540,10 +553,8 @@ static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext,
 				Desc.FrontFace.StencilFunc == D3D11_COMPARISON_ALWAYS &&
 				Desc.BackFace.StencilFunc == D3D11_COMPARISON_ALWAYS)
 			{
-				isOutlinePass = true;
-
-// 				if (g_AutoAimAnalyzer == NULL)
-// 					g_AutoAimAnalyzer = new AutoAimAnalyzer(pContext);
+				if (g_AutoAimAnalyzer == NULL)
+					g_AutoAimAnalyzer = new AutoAimAnalyzer(pContext);
 
 				if (g_AutoAimAnalyzer != NULL)
 					g_AutoAimAnalyzer->OnDrawEnemyPart(IndexCount, StartIndexLocation, BaseVertexLocation);
@@ -551,27 +562,44 @@ static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext,
 				Desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
 
 				ID3D11Device* pDevice;
-				ID3D11DepthStencilState* pHackedDepthStencilState;
+				ID3D11DepthStencilState* pHackedDepthStencilState = NULL;
 				pContext->GetDevice(&pDevice);
-				pDevice->CreateDepthStencilState(&Desc, &pHackedDepthStencilState);
-
-				pContext->OMSetDepthStencilState(pHackedDepthStencilState, stencilRef);
-
-				pHackedDepthStencilState->Release();
-				pDevice->Release();
+				if (pDevice == NULL)
+				{
+					g_Logger->critical("No device retrived from context {}", (void*) pContext);
+				}
+				else
+				{
+					pDevice->CreateDepthStencilState(&Desc, &pHackedDepthStencilState);
+					pContext->OMSetDepthStencilState(pHackedDepthStencilState, stencilRef);
+					changedDS = true;
+				}
+				
+				SAFE_RELEASE(pHackedDepthStencilState);
+				SAFE_RELEASE(pDevice);
 			}
 		}
 	}
 	
 	tDrawIndexed pfnOriginal = (tDrawIndexed) g_DrawIndexedHook->GetOriginalPtr(pContext);
-	pfnOriginal(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+	if (pfnOriginal != NULL)
+	{
+		pfnOriginal(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+	}
+	else
+	{
+		g_Logger->critical("no original DrawIndexed functions {} {}", (void*) pContext, 
+						   (void*) g_DrawIndexedHook->GetVTableFuncPtr(pContext));
+
+	}
 
 	// restore depth stencil state.
-	if (isOutlinePass)
+	if (changedDS)
+	{
 		pContext->OMSetDepthStencilState(pDepthStencilState, stencilRef);
+	}
 
-	if (pDepthStencilState != NULL)
-		pDepthStencilState->Release();
+	SAFE_RELEASE(pDepthStencilState);
 }
 
 static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext)
@@ -712,9 +740,9 @@ typedef HRESULT(STDMETHODCALLTYPE *tPresent)(
 static HRESULT STDMETHODCALLTYPE Hooked_Present(
 	IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags)
 {
-// 	g_Logger->debug("hooked_present");
+	// 	g_Logger->debug("hooked_present");
 	ID3D11Device* pD3DDevice;
-	pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**) &pD3DDevice);
+	pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&pD3DDevice);
 	if (pD3DDevice != NULL)
 	{
 		auto it = g_D3D11AddonDatas.find(pD3DDevice);
@@ -734,7 +762,16 @@ static HRESULT STDMETHODCALLTYPE Hooked_Present(
 	}
 
 	tPresent pfn = (tPresent)g_SwapChain_PresentHook->GetOriginalPtr(pSwapChain);
-	return pfn(pSwapChain, SyncInterval, Flags);
+	if (pfn != NULL)
+	{
+		return pfn(pSwapChain, SyncInterval, Flags);
+	}
+	else
+	{
+		g_Logger->critical("no original Present function found {} {}", (void*) pSwapChain,
+						   (void*) g_SwapChain_PresentHook->GetVTableFuncPtr(pSwapChain));
+		return S_OK;
+	}
 }
 
 static void HookSwapChain(IDXGISwapChain* pSwapChain)
@@ -759,7 +796,19 @@ static HRESULT STDMETHODCALLTYPE Hooked_CreateSwapChain(
 {
 	g_Logger->debug("IDXGIFactory::CreateSwapChain");
 	tCreateSwapChain pfn = (tCreateSwapChain)g_DXGIFactory_CreateSwapChainHook->GetOriginalPtr(pFactory);
-	HRESULT res = pfn(pFactory, pDevice, pDesc, ppSwapChain);
+
+	HRESULT res;
+	if (pfn != NULL)
+	{
+		res = pfn(pFactory, pDevice, pDesc, ppSwapChain);
+	}
+	else
+	{
+		res = E_INVALIDARG;
+		g_Logger->critical("no original CreateSwapChain function {} {}", (void*)pFactory,
+						   (void*)g_DXGIFactory_CreateSwapChainHook->GetVTableFuncPtr(pFactory));
+	}
+
 	if (pDevice != NULL && ppSwapChain != NULL && *ppSwapChain != NULL)
 	{
 		ID3D11Device* pD3D11Device = NULL;
@@ -780,7 +829,7 @@ static HRESULT STDMETHODCALLTYPE Hooked_CreateSwapChain(
 	return res;
 }
 
-static void Hooked_DXGIFactory(void** ppFactory)
+static void HookDXGIFactory(void** ppFactory)
 {
 	if (ppFactory && *ppFactory)
 	{
@@ -801,7 +850,7 @@ HRESULT WINAPI Hooked_CreateDXGIFactory(REFIID riid, _Out_ void **ppFactory)
 {
 	tCreateDXGIFactory pfn = (tCreateDXGIFactory)Hooked_GetProcAddress(hDXGI, "CreateDXGIFactory");
 	HRESULT res = pfn(riid, ppFactory);
-	Hooked_DXGIFactory(ppFactory);
+	HookDXGIFactory(ppFactory);
 	return res;
 }
 
@@ -810,7 +859,7 @@ HRESULT WINAPI Hooked_CreateDXGIFactory1(REFIID riid, _Out_ void **ppFactory)
 {
 	tCreateDXGIFactory1 pfn = (tCreateDXGIFactory1)Hooked_GetProcAddress(hDXGI, "CreateDXGIFactory1");
 	HRESULT res = pfn(riid, ppFactory);
-	Hooked_DXGIFactory(ppFactory);
+	HookDXGIFactory(ppFactory);
 	return res;
 }
 
@@ -818,7 +867,7 @@ HRESULT WINAPI Hooked_CreateDXGIFactory2(UINT Flags, REFIID riid, _Out_ void **p
 {
 	tCreateDXGIFactory2 pfn = (tCreateDXGIFactory2)Hooked_GetProcAddress(hDXGI, "CreateDXGIFactory2");
 	HRESULT res = pfn(Flags, riid, ppFactory);
-	Hooked_DXGIFactory(ppFactory);
+	HookDXGIFactory(ppFactory);
 	return res;
 }
 
@@ -948,9 +997,9 @@ bool InitD3D11AndRenderdoc(HMODULE currentModule)
 		sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "D3D11CreateDevice", (FARPROC)&CreateDerivedD3D11Device));
 		sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDeviceAndSwapChain", (FARPROC)&CreateDerivedD3D11DeviceAndSwapChain));
 		sDetourHooks.push_back(DetourHookInfo(hD3D11, "D3D11CreateDevice", (FARPROC)&CreateDerivedD3D11Device));
-// 		sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory", (FARPROC)&Hooked_CreateDXGIFactory));
-// 		sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory1", (FARPROC)&Hooked_CreateDXGIFactory1));
-// 		sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory2", (FARPROC)&Hooked_CreateDXGIFactory2));
+		sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory", (FARPROC)&Hooked_CreateDXGIFactory));
+		sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory1", (FARPROC)&Hooked_CreateDXGIFactory1));
+		sDetourHooks.push_back(DetourHookInfo(hDXGI, "CreateDXGIFactory2", (FARPROC)&Hooked_CreateDXGIFactory2));
 	}
 
 	sDetourHooks.push_back(DetourHookInfo(hCurrentModule, "CreateDirect3D11DeviceFromDXGIDevice", hD3D11));

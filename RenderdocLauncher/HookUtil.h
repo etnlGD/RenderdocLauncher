@@ -47,6 +47,8 @@ public:
 
 	uint8_t* GetOriginalPtr(void* pObject);
 
+	uint8_t* GetVTableFuncPtr(void* pObject);
+
 private:
 	std::map<uint8_t*, void*> AllDetours;
 };
