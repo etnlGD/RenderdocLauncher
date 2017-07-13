@@ -393,7 +393,32 @@ struct SD3D11DeviceAddOn
 		return pRTV;
 	}
 
-	void OnRenderEnd(ID3D11RenderTargetView* pRTV)
+	void SetCursorPosF(HWND hwnd, float x, float y)
+	{
+		RECT wndRect;
+		GetWindowRect(hwnd, &wndRect);
+
+// 		POINT targetPt;
+// 		targetPt.x = (LONG) ((wndRect.right - wndRect.left) * x);
+// 		targetPt.y = (LONG) ((wndRect.bottom - wndRect.top) * y);
+// 
+// 		ClientToScreen(hwnd, &targetPt);
+// 
+// 		POINT mousePt;
+// 		GetCursorPos(&mousePt);
+
+		INPUT mouseMove;
+		mouseMove.type = INPUT_MOUSE;
+		mouseMove.mi.dx = (LONG) ((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
+		mouseMove.mi.dy = (LONG)((y - 0.5f) * (wndRect.bottom - wndRect.top)); // targetPt.y - mousePt.y;
+		mouseMove.mi.mouseData = 0;
+		mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
+		mouseMove.mi.time = 0;
+		mouseMove.mi.dwExtraInfo = NULL;
+		SendInput(1, &mouseMove, sizeof(INPUT));
+	}
+
+	void OnRenderEnd(ID3D11RenderTargetView* pRTV, HWND OutputWnd)
 	{
 		rdcboost::SDeviceContextState contextState;
 		contextState.GetFromContext(pContext, NULL);
@@ -405,14 +430,48 @@ struct SD3D11DeviceAddOn
 			pResult = &g_AutoAimAnalyzer->GetResult();
 		}
 
-		if (pResult && !pResult->empty())
+		UINT BackBufferWidth, BackBufferHeight;
 		{
 			ID3D11Resource* pBackBuffer = NULL;
 			pRTV->GetResource(&pBackBuffer);
-
 			D3D11_TEXTURE2D_DESC BackBufferDesc;
 			static_cast<ID3D11Texture2D*>(pBackBuffer)->GetDesc(&BackBufferDesc);
 			SAFE_RELEASE(pBackBuffer);
+
+			BackBufferWidth = BackBufferDesc.Width;
+			BackBufferHeight = BackBufferDesc.Height;
+		}
+
+		if (pResult && !pResult->empty())
+		{
+			static float prevMinDist = FLT_MAX;
+			float minDistToCenter = FLT_MAX;
+			Vec2 targetPos;
+			for (auto it = pResult->begin(); it != pResult->end(); ++it)
+			{
+				float dist = sqrt(pow(it->x - 0.5f, 2.0f) + pow(it->y - 0.5f, 2.0f));
+				if (minDistToCenter > dist)
+				{
+					minDistToCenter = dist;
+					targetPos = *it;
+				}
+			}
+
+			if (minDistToCenter < 0.1f && minDistToCenter > 0.001f)
+			{
+				Vec2 vec;
+				vec.x = targetPos.x - 0.5f;
+				vec.y = targetPos.y - 0.5f;
+				vec.x /= minDistToCenter;
+				vec.y /= minDistToCenter;
+
+				vec.x *= std::min(minDistToCenter * 0.4f, 0.01f);
+				vec.y *= std::min(minDistToCenter * 0.4f, 0.01f);
+
+				vec.x += 0.5f;
+				vec.y += 0.5f;
+				SetCursorPosF(OutputWnd, vec.x, vec.y);
+			}
 
 			pContext->ClearState();
 
@@ -447,8 +506,8 @@ struct SD3D11DeviceAddOn
 			D3D11_VIEWPORT viewport;
 			viewport.TopLeftX = 0;
 			viewport.TopLeftY = 0;
-			viewport.Width = (FLOAT)BackBufferDesc.Width;
-			viewport.Height = (FLOAT)BackBufferDesc.Height;
+			viewport.Width = (FLOAT)BackBufferWidth;
+			viewport.Height = (FLOAT)BackBufferHeight;
 			viewport.MinDepth = 0;
 			viewport.MaxDepth = 1;
 			pContext->RSSetViewports(1, &viewport);
@@ -470,7 +529,10 @@ struct SD3D11DeviceAddOn
 			return;
 		}
 
-		OnRenderEnd(pRTV);
+		DXGI_SWAP_CHAIN_DESC SwapChainDesc;
+		pSwapChain->GetDesc(&SwapChainDesc);
+
+		OnRenderEnd(pRTV, SwapChainDesc.OutputWindow);
 	}
 };
 
@@ -478,38 +540,6 @@ std::map<ID3D11Device*, SD3D11DeviceAddOn*> g_D3D11AddonDatas;
 static void STDMETHODCALLTYPE Hooked_Draw(ID3D11DeviceContext* pContext,
 										  UINT VertexCount, UINT StartVertexLocation)
 {
-// 	if (g_DebugMode || g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos)
-// 	{
-// 		UINT stencilRef = 0;
-// 		ID3D11DepthStencilState* pDepthStencilState = NULL;
-// 		pContext->OMGetDepthStencilState(&pDepthStencilState, &stencilRef);
-// 
-// 		if (pDepthStencilState != NULL && stencilRef == 0x20)
-// 		{
-// 			D3D11_DEPTH_STENCIL_DESC Desc;
-// 			pDepthStencilState->GetDesc(&Desc);
-// 			SAFE_RELEASE(pDepthStencilState);
-// 
-// 			if (Desc.DepthEnable == FALSE && Desc.DepthFunc == D3D11_COMPARISON_LESS &&
-// 				Desc.StencilEnable == TRUE && Desc.StencilWriteMask == 0x00 &&
-// 				Desc.StencilReadMask == 0x20 &&
-// 				Desc.FrontFace.StencilFunc == D3D11_COMPARISON_NOT_EQUAL &&
-// 				Desc.BackFace.StencilFunc == D3D11_COMPARISON_NOT_EQUAL)
-// 			{
-// 				ID3D11Device* pD3DDevice;
-// 				pContext->GetDevice(&pD3DDevice);
-// 				if (g_D3D11AddonDatas.find(pD3DDevice) != g_D3D11AddonDatas.end())
-// 				{
-// 					ID3D11RenderTargetView* pRTV;
-// 					pContext->OMGetRenderTargets(1, &pRTV, NULL);
-// 					g_D3D11AddonDatas[pD3DDevice]->OnRenderEnd(pRTV);
-// 					SAFE_RELEASE(pRTV);
-// 				}
-// 				SAFE_RELEASE(pD3DDevice);
-// 			}
-// 		}
-// 	}
-
 	tDraw pfnOriginal = (tDraw)g_DrawHook->GetOriginalPtr(pContext);
 	pfnOriginal(pContext, VertexCount, StartVertexLocation);
 }

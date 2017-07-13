@@ -167,9 +167,10 @@ bool AutoAimAnalyzer::GetReferenceVert(const std::vector<SDrawData>& drawcalls, 
 	}
 
 	if (maxY - minY < 0.75f || maxZ - minZ < 0.1f || maxX - minX < 0.1f) // maybe a weapon
-	{
 		return false;
-	}
+
+	if (maxX - minX > 3.0f || maxZ - minZ > 3.0f) // maybe the car
+		return false;
 
 #define TARGET_POS_RATIO 0.9f
 	float targetX = 0, targetY = maxY * TARGET_POS_RATIO, targetZ = 0;
