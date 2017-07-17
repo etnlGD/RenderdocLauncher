@@ -298,6 +298,30 @@ static void DetourDrawIndexedRetAddr(void** ppRetAddr)
 }
 
 static AutoAimAnalyzer* g_AutoAimAnalyzer;
+struct KeyState 
+{
+	enum {
+		KEY_UP, KEY_DOWN, KEY_PRESSING
+	};
+	KeyState(int vKey) : vKey(vKey), keyState(KEY_UP) {}
+
+	int update()
+	{
+		bool KeyDown = GetAsyncKeyState(vKey) != 0;
+		if (KeyDown && keyState == 0)
+			keyState = KEY_DOWN; // down
+		else if (KeyDown && keyState == 1)
+			keyState = KEY_PRESSING; // pressing
+		else if (!KeyDown && keyState > 0)
+			keyState = KEY_UP; // up
+
+		return keyState;
+	}
+
+private:
+	int vKey;
+	int keyState; // up
+};
 
 struct SD3D11DeviceAddOn
 {
@@ -394,7 +418,32 @@ struct SD3D11DeviceAddOn
 		return pRTV;
 	}
 
-	void OnRenderEnd(ID3D11RenderTargetView* pRTV)
+	void SetCursorPosF(HWND hwnd, float x, float y)
+	{
+		RECT wndRect;
+		GetWindowRect(hwnd, &wndRect);
+
+// 		POINT targetPt;
+// 		targetPt.x = (LONG) ((wndRect.right - wndRect.left) * x);
+// 		targetPt.y = (LONG) ((wndRect.bottom - wndRect.top) * y);
+// 
+// 		ClientToScreen(hwnd, &targetPt);
+// 
+// 		POINT mousePt;
+// 		GetCursorPos(&mousePt);
+
+		INPUT mouseMove;
+		mouseMove.type = INPUT_MOUSE;
+		mouseMove.mi.dx = (LONG) ((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
+		mouseMove.mi.dy = (LONG)((y - 0.5f) * (wndRect.bottom - wndRect.top)); // targetPt.y - mousePt.y;
+		mouseMove.mi.mouseData = 0;
+		mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
+		mouseMove.mi.time = 0;
+		mouseMove.mi.dwExtraInfo = NULL;
+		SendInput(1, &mouseMove, sizeof(INPUT));
+	}
+
+	void OnRenderEnd(ID3D11RenderTargetView* pRTV, HWND OutputWnd)
 	{
 		rdcboost::SDeviceContextState contextState;
 		contextState.GetFromContext(pContext, NULL);
@@ -406,14 +455,128 @@ struct SD3D11DeviceAddOn
 			pResult = &g_AutoAimAnalyzer->GetResult();
 		}
 
-		if (pResult && !pResult->empty())
+		UINT BackBufferWidth, BackBufferHeight;
 		{
 			ID3D11Resource* pBackBuffer = NULL;
 			pRTV->GetResource(&pBackBuffer);
-
 			D3D11_TEXTURE2D_DESC BackBufferDesc;
 			static_cast<ID3D11Texture2D*>(pBackBuffer)->GetDesc(&BackBufferDesc);
 			SAFE_RELEASE(pBackBuffer);
+
+			BackBufferWidth = BackBufferDesc.Width;
+			BackBufferHeight = BackBufferDesc.Height;
+		}
+
+		static KeyState lKeyState(VK_MBUTTON);
+		if (lKeyState.update() == KeyState::KEY_DOWN)
+		{
+			INPUT mouseMove;
+			mouseMove.type = INPUT_MOUSE;
+			mouseMove.mi.dx = 2250;// (LONG)((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
+			mouseMove.mi.dy = 0;
+			mouseMove.mi.mouseData = 0;
+			mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
+			mouseMove.mi.time = 0;
+			mouseMove.mi.dwExtraInfo = NULL;
+			SendInput(1, &mouseMove, sizeof(INPUT));
+		}
+
+		static int skipState = 0;
+		static KeyState fKeyState('F');
+		static int aimbotState = 0;
+		if (fKeyState.update() == KeyState::KEY_DOWN)
+		{
+			aimbotState = (aimbotState + 1) % 2;
+		}
+		
+		static int lButtonFrames = 0;
+		bool enableAimbot;
+		if (aimbotState == 0)
+		{
+			enableAimbot = false;
+			lButtonFrames = 0;
+		}
+		else
+		{
+			if (GetAsyncKeyState(VK_LBUTTON) != 0)
+				lButtonFrames = 30;
+			else
+				--lButtonFrames;
+
+			enableAimbot = lButtonFrames > 0;
+		}
+		
+		bool setCursor = false;
+		if (pResult && !pResult->empty() && aimbotState != 0)
+		{
+			float minDistToCenter = FLT_MAX;
+			Vec2 targetPos, targetTex;
+
+			RECT wndRect;
+			GetClientRect(OutputWnd, &wndRect);
+			UINT wndWidth = (wndRect.right - wndRect.left);
+			UINT wndHeight = (wndRect.bottom - wndRect.top);
+			for (auto it = pResult->begin(); it != pResult->end(); ++it)
+			{
+				Vec2 point = { it->x * wndWidth, it->y * wndHeight, };
+				float dist = sqrt(pow(point.x - wndWidth / 2.0f, 2.0f) + 
+								  pow(point.y - wndHeight / 2.0f, 2.0f));
+
+				if (minDistToCenter > dist)
+				{
+					minDistToCenter = dist;
+					targetPos = point;
+					targetTex = *it;
+				}
+			}
+
+			{
+				const float nearToY = 1.41411f;
+				const float xToY = 16.0f / 9.0f;
+				if (enableAimbot && minDistToCenter < 100.0f && minDistToCenter >= 5.0f)
+				{
+					Vec2 vec;
+					vec.x = targetPos.x - wndWidth / 2.0f;
+					vec.y = targetPos.y - wndHeight / 2.0f;
+					vec.x /= minDistToCenter;
+					vec.y /= minDistToCenter; // normalized vec
+
+					Vec3 viewPos;
+					viewPos.x = (targetTex.x * 2.0f - 1.0f) * xToY;
+					viewPos.y = (1.0f - targetTex.y) * 2.0f - 1.0f;
+					viewPos.z = nearToY;
+
+					float rayLen = sqrt(viewPos.x * viewPos.x + viewPos.y * viewPos.y + viewPos.z * viewPos.z);
+					viewPos.x /= rayLen;
+					viewPos.y /= rayLen;
+					viewPos.z /= rayLen;
+
+					float dotZAxis = viewPos.z; // dot(viewPos, float3(0, 0, 1))
+					float deltaAngle = acos(dotZAxis);
+
+					float speed = 6.6666f;
+					vec.x *= deltaAngle / 3.1415926f * 180.0f * speed;
+					vec.y *= deltaAngle / 3.1415926f * 180.0f * speed;
+
+					vec.x += wndWidth / 2.0f;
+					vec.y += wndHeight / 2.0f; // convert from vector to point
+
+					if (!(skipState == 1 || skipState == 2))
+					{
+						SetCursorPosF(OutputWnd, vec.x / wndWidth, vec.y / wndHeight);
+					}
+					setCursor = true;
+				}
+			}
+
+			if (setCursor)
+			{
+				++skipState;
+			}
+			else
+			{
+				skipState = 0;
+			}
 
 			pContext->ClearState();
 
@@ -448,8 +611,8 @@ struct SD3D11DeviceAddOn
 			D3D11_VIEWPORT viewport;
 			viewport.TopLeftX = 0;
 			viewport.TopLeftY = 0;
-			viewport.Width = (FLOAT)BackBufferDesc.Width;
-			viewport.Height = (FLOAT)BackBufferDesc.Height;
+			viewport.Width = (FLOAT)BackBufferWidth;
+			viewport.Height = (FLOAT)BackBufferHeight;
 			viewport.MinDepth = 0;
 			viewport.MaxDepth = 1;
 			pContext->RSSetViewports(1, &viewport);
@@ -471,7 +634,10 @@ struct SD3D11DeviceAddOn
 			return;
 		}
 
-		OnRenderEnd(pRTV);
+		DXGI_SWAP_CHAIN_DESC SwapChainDesc;
+		pSwapChain->GetDesc(&SwapChainDesc);
+
+		OnRenderEnd(pRTV, SwapChainDesc.OutputWindow);
 	}
 };
 
@@ -479,38 +645,6 @@ std::map<ID3D11Device*, SD3D11DeviceAddOn*> g_D3D11AddonDatas;
 static void STDMETHODCALLTYPE Hooked_Draw(ID3D11DeviceContext* pContext,
 										  UINT VertexCount, UINT StartVertexLocation)
 {
-// 	if (g_DebugMode || g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos)
-// 	{
-// 		UINT stencilRef = 0;
-// 		ID3D11DepthStencilState* pDepthStencilState = NULL;
-// 		pContext->OMGetDepthStencilState(&pDepthStencilState, &stencilRef);
-// 
-// 		if (pDepthStencilState != NULL && stencilRef == 0x20)
-// 		{
-// 			D3D11_DEPTH_STENCIL_DESC Desc;
-// 			pDepthStencilState->GetDesc(&Desc);
-// 			SAFE_RELEASE(pDepthStencilState);
-// 
-// 			if (Desc.DepthEnable == FALSE && Desc.DepthFunc == D3D11_COMPARISON_LESS &&
-// 				Desc.StencilEnable == TRUE && Desc.StencilWriteMask == 0x00 &&
-// 				Desc.StencilReadMask == 0x20 &&
-// 				Desc.FrontFace.StencilFunc == D3D11_COMPARISON_NOT_EQUAL &&
-// 				Desc.BackFace.StencilFunc == D3D11_COMPARISON_NOT_EQUAL)
-// 			{
-// 				ID3D11Device* pD3DDevice;
-// 				pContext->GetDevice(&pD3DDevice);
-// 				if (g_D3D11AddonDatas.find(pD3DDevice) != g_D3D11AddonDatas.end())
-// 				{
-// 					ID3D11RenderTargetView* pRTV;
-// 					pContext->OMGetRenderTargets(1, &pRTV, NULL);
-// 					g_D3D11AddonDatas[pD3DDevice]->OnRenderEnd(pRTV);
-// 					SAFE_RELEASE(pRTV);
-// 				}
-// 				SAFE_RELEASE(pD3DDevice);
-// 			}
-// 		}
-// 	}
-
 	tDraw pfnOriginal = (tDraw)g_DrawHook->GetOriginalPtr(pContext);
 	pfnOriginal(pContext, VertexCount, StartVertexLocation);
 }
