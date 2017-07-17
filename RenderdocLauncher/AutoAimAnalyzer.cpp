@@ -172,7 +172,8 @@ bool AutoAimAnalyzer::GetReferenceVert(const std::vector<SDrawData>& drawcalls, 
 	if (maxX - minX > 3.0f || maxZ - minZ > 3.0f) // maybe the car
 		return false;
 
-#define TARGET_POS_RATIO 0.9f
+// #define TARGET_POS_RATIO 0.9f // head shot
+#define TARGET_POS_RATIO 0.7f // body shot
 	float targetX = 0, targetY = maxY * TARGET_POS_RATIO, targetZ = 0;
 	float minDist2ToTarget = FLT_MAX;
 
@@ -360,7 +361,7 @@ void AutoAimAnalyzer::OnFrameEnd()
 			drawcalls.push_back(m_CurFrameDrawDatas[it->second]);
 		}
 
-		if (drawcalls.size() > 1 && totalIndexCount >= 3000)
+		if (totalIndexCount >= 3000)
 		{ // reject enemy equipment
 			char refVertRaw[OBJECT_VB_STRIDE];
 			if (GetReferenceVert(drawcalls, refVertRaw))

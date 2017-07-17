@@ -297,6 +297,30 @@ static void DetourDrawIndexedRetAddr(void** ppRetAddr)
 }
 
 static AutoAimAnalyzer* g_AutoAimAnalyzer;
+struct KeyState 
+{
+	enum {
+		KEY_UP, KEY_DOWN, KEY_PRESSING
+	};
+	KeyState(int vKey) : vKey(vKey), keyState(KEY_UP) {}
+
+	int update()
+	{
+		bool KeyDown = GetAsyncKeyState(vKey) != 0;
+		if (KeyDown && keyState == 0)
+			keyState = KEY_DOWN; // down
+		else if (KeyDown && keyState == 1)
+			keyState = KEY_PRESSING; // pressing
+		else if (!KeyDown && keyState > 0)
+			keyState = KEY_UP; // up
+
+		return keyState;
+	}
+
+private:
+	int vKey;
+	int keyState; // up
+};
 
 struct SD3D11DeviceAddOn
 {
@@ -442,35 +466,115 @@ struct SD3D11DeviceAddOn
 			BackBufferHeight = BackBufferDesc.Height;
 		}
 
-		if (pResult && !pResult->empty())
+		static KeyState lKeyState(VK_MBUTTON);
+		if (lKeyState.update() == KeyState::KEY_DOWN)
 		{
-			static float prevMinDist = FLT_MAX;
+			INPUT mouseMove;
+			mouseMove.type = INPUT_MOUSE;
+			mouseMove.mi.dx = 2250;// (LONG)((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
+			mouseMove.mi.dy = 0;
+			mouseMove.mi.mouseData = 0;
+			mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
+			mouseMove.mi.time = 0;
+			mouseMove.mi.dwExtraInfo = NULL;
+			SendInput(1, &mouseMove, sizeof(INPUT));
+		}
+
+		static int skipState = 0;
+		static KeyState fKeyState('F');
+		static int aimbotState = 0;
+		if (fKeyState.update() == KeyState::KEY_DOWN)
+		{
+			aimbotState = (aimbotState + 1) % 2;
+		}
+		
+		static int lButtonFrames = 0;
+		bool enableAimbot;
+		if (aimbotState == 0)
+		{
+			enableAimbot = false;
+			lButtonFrames = 0;
+		}
+		else
+		{
+			if (GetAsyncKeyState(VK_LBUTTON) != 0)
+				lButtonFrames = 30;
+			else
+				--lButtonFrames;
+
+			enableAimbot = lButtonFrames > 0;
+		}
+		
+		bool setCursor = false;
+		if (pResult && !pResult->empty() && aimbotState != 0)
+		{
 			float minDistToCenter = FLT_MAX;
-			Vec2 targetPos;
+			Vec2 targetPos, targetTex;
+
+			RECT wndRect;
+			GetClientRect(OutputWnd, &wndRect);
+			UINT wndWidth = (wndRect.right - wndRect.left);
+			UINT wndHeight = (wndRect.bottom - wndRect.top);
 			for (auto it = pResult->begin(); it != pResult->end(); ++it)
 			{
-				float dist = sqrt(pow(it->x - 0.5f, 2.0f) + pow(it->y - 0.5f, 2.0f));
+				Vec2 point = { it->x * wndWidth, it->y * wndHeight, };
+				float dist = sqrt(pow(point.x - wndWidth / 2.0f, 2.0f) + 
+								  pow(point.y - wndHeight / 2.0f, 2.0f));
+
 				if (minDistToCenter > dist)
 				{
 					minDistToCenter = dist;
-					targetPos = *it;
+					targetPos = point;
+					targetTex = *it;
 				}
 			}
 
-			if (minDistToCenter < 0.1f && minDistToCenter > 0.001f)
 			{
-				Vec2 vec;
-				vec.x = targetPos.x - 0.5f;
-				vec.y = targetPos.y - 0.5f;
-				vec.x /= minDistToCenter;
-				vec.y /= minDistToCenter;
+				const float nearToY = 1.41411f;
+				const float xToY = 16.0f / 9.0f;
+				if (enableAimbot && minDistToCenter < 100.0f && minDistToCenter >= 5.0f)
+				{
+					Vec2 vec;
+					vec.x = targetPos.x - wndWidth / 2.0f;
+					vec.y = targetPos.y - wndHeight / 2.0f;
+					vec.x /= minDistToCenter;
+					vec.y /= minDistToCenter; // normalized vec
 
-				vec.x *= std::min(minDistToCenter * 0.4f, 0.01f);
-				vec.y *= std::min(minDistToCenter * 0.4f, 0.01f);
+					Vec3 viewPos;
+					viewPos.x = (targetTex.x * 2.0f - 1.0f) * xToY;
+					viewPos.y = (1.0f - targetTex.y) * 2.0f - 1.0f;
+					viewPos.z = nearToY;
 
-				vec.x += 0.5f;
-				vec.y += 0.5f;
-				SetCursorPosF(OutputWnd, vec.x, vec.y);
+					float rayLen = sqrt(viewPos.x * viewPos.x + viewPos.y * viewPos.y + viewPos.z * viewPos.z);
+					viewPos.x /= rayLen;
+					viewPos.y /= rayLen;
+					viewPos.z /= rayLen;
+
+					float dotZAxis = viewPos.z; // dot(viewPos, float3(0, 0, 1))
+					float deltaAngle = acos(dotZAxis);
+
+					float speed = 6.6666f;
+					vec.x *= deltaAngle / 3.1415926f * 180.0f * speed;
+					vec.y *= deltaAngle / 3.1415926f * 180.0f * speed;
+
+					vec.x += wndWidth / 2.0f;
+					vec.y += wndHeight / 2.0f; // convert from vector to point
+
+					if (!(skipState == 1 || skipState == 2))
+					{
+						SetCursorPosF(OutputWnd, vec.x / wndWidth, vec.y / wndHeight);
+					}
+					setCursor = true;
+				}
+			}
+
+			if (setCursor)
+			{
+				++skipState;
+			}
+			else
+			{
+				skipState = 0;
 			}
 
 			pContext->ClearState();
