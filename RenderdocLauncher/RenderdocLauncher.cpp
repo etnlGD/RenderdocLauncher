@@ -19,6 +19,7 @@
 #include <set>
 
 #include "PolyHook/PolyHookTools.hpp"
+#include <Psapi.h>
 
 static bool g_RenderdocMode = false;
 extern bool g_DebugMode = false;
@@ -588,8 +589,9 @@ static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext,
 	}
 	else
 	{
-		g_Logger->critical("no original DrawIndexed functions {} {}", (void*) pContext, 
-						   (void*) g_DrawIndexedHook->GetVTableFuncPtr(pContext));
+		g_Logger->critical("no original DrawIndexed functions {} {} ImmediateCtx: {}", 
+						   (void*) pContext, (void*) g_DrawIndexedHook->GetVTableFuncPtr(pContext), 
+						   pContext->GetType());
 
 	}
 
@@ -614,14 +616,14 @@ static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext)
 
 	g_DrawIndexedHook->HookObject(pContext);
 
-// 	if (g_DrawHook == NULL)
-// 	{
-// 		const int Draw_VTABLE_INDEX = 13;
-// 		g_DrawHook = new VTableHook(Draw_VTABLE_INDEX, &Hooked_Draw,
-// 									"ID3D11DeviceContext::Draw(UINT, UINT)", 32);
-// 	}
-// 
-// 	g_DrawHook->HookObject(pContext);
+	if (g_DrawHook == NULL)
+	{
+		const int Draw_VTABLE_INDEX = 13;
+		g_DrawHook = new VTableHook(Draw_VTABLE_INDEX, &Hooked_Draw,
+									"ID3D11DeviceContext::Draw(UINT, UINT)", 32);
+	}
+
+	g_DrawHook->HookObject(pContext);
 }
 
 static void HookD3D11Device(ID3D11Device** ppDevice)
@@ -839,7 +841,7 @@ static void HookDXGIFactory(void** ppFactory)
 			const int CreateSwapChain_VTABLE_INDEX = 10;
 			g_DXGIFactory_CreateSwapChainHook = 
 				new VTableHook(CreateSwapChain_VTABLE_INDEX, &Hooked_CreateSwapChain, 
-							   "IDXGIFactory::CreateDXGIFactory(REFIID, void**)", 32);
+							   "IDXGIFactory::CreateSwapChain(REFIID, void**)", 32);
 		}
 
 		g_DXGIFactory_CreateSwapChainHook->HookObject(*ppFactory);
@@ -928,6 +930,33 @@ void initGlobalLog()
 bool InitD3D11AndRenderdoc(HMODULE currentModule)
 {
 	initGlobalLog();
+
+	// 	csh handle;
+	// 	cs_err err = cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
+	// 	LogInstructions(*(uint8_t**)(0x7ffd079d2ef8 + 0xccfb8), handle);
+	// 	LogInstructions(*(uint8_t**)(0x7ffd079d4e05 + 0xcb0ab), handle);
+	// 	cs_close(&handle);
+
+	{
+		HMODULE hMods[1024];
+		DWORD cbNeeded;
+		HANDLE hProcess = GetCurrentProcess();
+		if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded))
+		{
+			for (uint32_t i = 0; i < (cbNeeded / sizeof(HMODULE)); i++)
+			{
+				TCHAR szModName[MAX_PATH];
+
+				// Get the full path to the module's file.
+				if (GetModuleFileNameEx(hProcess, hMods[i], szModName,
+					sizeof(szModName) / sizeof(TCHAR)))
+				{
+					// Print the module name and handle value.
+					g_Logger->info("Loaded Module: {}", w2s(szModName));
+				}
+			}
+		}
+	}
 
 	g_JIT = new asmjit::JitRuntime;
 	hCurrentModule = currentModule;
