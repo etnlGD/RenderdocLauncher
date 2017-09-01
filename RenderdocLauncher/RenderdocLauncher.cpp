@@ -19,9 +19,11 @@
 #include <set>
 
 #include "PolyHook/PolyHookTools.hpp"
+#include "NTPClient.h"
+#include "AutoAimPerformer.h"
 
 static bool g_RenderdocMode = false;
-extern bool g_DebugMode = false;
+extern bool g_DebugMode = true;
 
 extern std::wstring g_HookedProcessName = L"";
 extern HMODULE hD3D11 = 0;
@@ -297,6 +299,7 @@ static void DetourDrawIndexedRetAddr(void** ppRetAddr)
 }
 
 static AutoAimAnalyzer* g_AutoAimAnalyzer;
+static AutoAimPerformer* g_AutoAimPerformer;
 struct KeyState 
 {
 	enum {
@@ -417,39 +420,44 @@ struct SD3D11DeviceAddOn
 		return pRTV;
 	}
 
-	void SetCursorPosF(HWND hwnd, float x, float y)
-	{
-		RECT wndRect;
-		GetWindowRect(hwnd, &wndRect);
-
-// 		POINT targetPt;
-// 		targetPt.x = (LONG) ((wndRect.right - wndRect.left) * x);
-// 		targetPt.y = (LONG) ((wndRect.bottom - wndRect.top) * y);
-// 
-// 		ClientToScreen(hwnd, &targetPt);
-// 
-// 		POINT mousePt;
-// 		GetCursorPos(&mousePt);
-
-		INPUT mouseMove;
-		mouseMove.type = INPUT_MOUSE;
-		mouseMove.mi.dx = (LONG) ((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
-		mouseMove.mi.dy = (LONG)((y - 0.5f) * (wndRect.bottom - wndRect.top)); // targetPt.y - mousePt.y;
-		mouseMove.mi.mouseData = 0;
-		mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
-		mouseMove.mi.time = 0;
-		mouseMove.mi.dwExtraInfo = NULL;
-		SendInput(1, &mouseMove, sizeof(INPUT));
-	}
-
 	void OnRenderEnd(ID3D11RenderTargetView* pRTV, HWND OutputWnd)
 	{
+		static bool dotShootMode = true;
+		static KeyState _0KeyState('0');
+		static KeyState _9KeyState('9');
+		if (_0KeyState.update() == KeyState::KEY_DOWN)
+		{
+			dotShootMode = true;
+			printf("MCCREE mode\n");
+		}
+
+		if (_9KeyState.update() == KeyState::KEY_DOWN)
+		{
+			dotShootMode = false;
+			printf("Soldier_76 mode\n");
+		}
+
 		rdcboost::SDeviceContextState contextState;
 		contextState.GetFromContext(pContext, NULL);
 
-		const std::vector<Vec2>* pResult = NULL;
+		const std::vector<AutoAimAnalyzer::SAimResult>* pResult = NULL;
 		if (g_AutoAimAnalyzer != NULL)
 		{
+			const float minRatio = 0.7f, maxRatio = 0.9f;
+
+			if (dotShootMode)
+			{
+				static double ratio = 0;
+				if ((ratio += 0.02345678) > 100)
+					ratio = 0;
+
+				ratio = fmod(ratio, (double) maxRatio - minRatio);
+				g_AutoAimAnalyzer->SetShootPosRatio((float) ratio + minRatio);
+			}
+			else
+			{
+				g_AutoAimAnalyzer->SetShootPosRatio(0.7f);
+			}
 			g_AutoAimAnalyzer->OnFrameEnd();
 			pResult = &g_AutoAimAnalyzer->GetResult();
 		}
@@ -466,8 +474,8 @@ struct SD3D11DeviceAddOn
 			BackBufferHeight = BackBufferDesc.Height;
 		}
 
-		static KeyState lKeyState(VK_MBUTTON);
-		if (lKeyState.update() == KeyState::KEY_DOWN)
+		static KeyState middleKeyState(VK_MBUTTON);
+		if (middleKeyState.update() == KeyState::KEY_DOWN)
 		{
 			INPUT mouseMove;
 			mouseMove.type = INPUT_MOUSE;
@@ -480,105 +488,86 @@ struct SD3D11DeviceAddOn
 			SendInput(1, &mouseMove, sizeof(INPUT));
 		}
 
-		static int skipState = 0;
 		static KeyState fKeyState('F');
 		static int aimbotState = 0;
 		if (fKeyState.update() == KeyState::KEY_DOWN)
 		{
 			aimbotState = (aimbotState + 1) % 2;
+			printf("AIMBOT: %s\n", aimbotState ? "ON" : "OFF");
 		}
-		
-		static int lButtonFrames = 0;
-		bool enableAimbot;
-		if (aimbotState == 0)
+
+		bool enableAimbot = false;
+		if (dotShootMode)
 		{
-			enableAimbot = false;
-			lButtonFrames = 0;
+			if (aimbotState != 0)
+			{
+				static KeyState leftKeyState(VK_LBUTTON);
+				static int aimFrames = -1000;
+				if (leftKeyState.update() == KeyState::KEY_DOWN)
+				{
+					if (aimFrames < -1)
+						aimFrames = 6;
+				}
+
+				if (aimFrames > 0)
+				{
+					enableAimbot = true;
+				}
+				else if (aimFrames == 0)
+				{
+					INPUT shootDown;
+					shootDown.type = INPUT_KEYBOARD;
+					shootDown.ki.wVk = 'B';
+					shootDown.ki.wScan = 0;
+					shootDown.ki.dwFlags = 0;
+					shootDown.ki.time = 0;
+					shootDown.ki.dwExtraInfo = 0;
+					SendInput(1, &shootDown, sizeof(INPUT));
+				}
+				else if (aimFrames == -1)
+				{
+					INPUT shootDown;
+					shootDown.type = INPUT_KEYBOARD;
+					shootDown.ki.wVk = 'B';
+					shootDown.ki.wScan = 0;
+					shootDown.ki.dwFlags = KEYEVENTF_KEYUP;
+					shootDown.ki.time = 0;
+					shootDown.ki.dwExtraInfo = 0;
+					SendInput(1, &shootDown, sizeof(INPUT));
+				}
+
+				--aimFrames;
+			}
 		}
 		else
 		{
-			if (GetAsyncKeyState(VK_LBUTTON) != 0)
-				lButtonFrames = 30;
+			static int lButtonFrames = 0;
+			if (aimbotState == 0)
+			{
+				lButtonFrames = 0;
+			}
 			else
-				--lButtonFrames;
+			{
+				if (GetAsyncKeyState(VK_LBUTTON) != 0)
+					lButtonFrames = 30;
+				else
+					--lButtonFrames;
 
-			enableAimbot = lButtonFrames > 0;
+				enableAimbot = lButtonFrames > 0;
+			}
 		}
 		
-		bool setCursor = false;
 		if (pResult && !pResult->empty() && aimbotState != 0)
 		{
-			float minDistToCenter = FLT_MAX;
-			Vec2 targetPos, targetTex;
+			if (g_AutoAimPerformer == NULL)
+				g_AutoAimPerformer = new AutoAimPerformer;
 
-			RECT wndRect;
-			GetClientRect(OutputWnd, &wndRect);
-			UINT wndWidth = (wndRect.right - wndRect.left);
-			UINT wndHeight = (wndRect.bottom - wndRect.top);
-			for (auto it = pResult->begin(); it != pResult->end(); ++it)
-			{
-				Vec2 point = { it->x * wndWidth, it->y * wndHeight, };
-				float dist = sqrt(pow(point.x - wndWidth / 2.0f, 2.0f) + 
-								  pow(point.y - wndHeight / 2.0f, 2.0f));
-
-				if (minDistToCenter > dist)
-				{
-					minDistToCenter = dist;
-					targetPos = point;
-					targetTex = *it;
-				}
-			}
-
-			{
-				const float nearToY = 1.41411f;
-				const float xToY = 16.0f / 9.0f;
-				if (enableAimbot && minDistToCenter < 100.0f && minDistToCenter >= 5.0f)
-				{
-					Vec2 vec;
-					vec.x = targetPos.x - wndWidth / 2.0f;
-					vec.y = targetPos.y - wndHeight / 2.0f;
-					vec.x /= minDistToCenter;
-					vec.y /= minDistToCenter; // normalized vec
-
-					Vec3 viewPos;
-					viewPos.x = (targetTex.x * 2.0f - 1.0f) * xToY;
-					viewPos.y = (1.0f - targetTex.y) * 2.0f - 1.0f;
-					viewPos.z = nearToY;
-
-					float rayLen = sqrt(viewPos.x * viewPos.x + viewPos.y * viewPos.y + viewPos.z * viewPos.z);
-					viewPos.x /= rayLen;
-					viewPos.y /= rayLen;
-					viewPos.z /= rayLen;
-
-					float dotZAxis = viewPos.z; // dot(viewPos, float3(0, 0, 1))
-					float deltaAngle = acos(dotZAxis);
-
-					float speed = 6.6666f;
-					vec.x *= deltaAngle / 3.1415926f * 180.0f * speed;
-					vec.y *= deltaAngle / 3.1415926f * 180.0f * speed;
-
-					vec.x += wndWidth / 2.0f;
-					vec.y += wndHeight / 2.0f; // convert from vector to point
-
-					if (!(skipState == 1 || skipState == 2))
-					{
-						SetCursorPosF(OutputWnd, vec.x / wndWidth, vec.y / wndHeight);
-					}
-					setCursor = true;
-				}
-			}
-
-			if (setCursor)
-			{
-				++skipState;
-			}
-			else
-			{
-				skipState = 0;
-			}
+			g_AutoAimPerformer->SetOutputWnd(OutputWnd);
+			size_t selectedId = g_AutoAimPerformer->ProcessResults(enableAimbot, pResult);
 
 			pContext->ClearState();
 
+			enum { MAX_RESULT_SIZE = 64 };
 			D3D11_MAPPED_SUBRESOURCE subres;
 			HRESULT res = pContext->Map(pCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &subres);
 			if (SUCCEEDED(res))
@@ -587,15 +576,21 @@ struct SD3D11DeviceAddOn
 				size_t idx = 0;
 				for (auto it = pResult->begin(); it != pResult->end(); ++it, ++idx)
 				{
-					if (idx * 16 >= CBSize)
+					if (idx >= MAX_RESULT_SIZE)
 					{
 						g_Logger->error("Too many result found by AutoAim");
 						break;
 					}
 
-					((float*)subres.pData)[idx * 4 + 0] = it->x;
-					((float*)subres.pData)[idx * 4 + 1] = it->y;
+					((float*)subres.pData)[idx * 4 + 0] = it->onScreenPos.x;
+					((float*)subres.pData)[idx * 4 + 1] = it->onScreenPos.y;
 				}
+
+				((float*)subres.pData)[MAX_RESULT_SIZE * 4 + 0] = 5.0f; // triangle size
+				((float*)subres.pData)[MAX_RESULT_SIZE * 4 + 1] = (float) BackBufferWidth; 
+				((float*)subres.pData)[MAX_RESULT_SIZE * 4 + 2] = (float) BackBufferHeight;
+				((uint32_t*)subres.pData)[MAX_RESULT_SIZE * 4 + 3] = (uint32_t)selectedId;
+
 				pContext->Unmap(pCB, 0);
 			}
 			else
@@ -605,6 +600,7 @@ struct SD3D11DeviceAddOn
 			
 			pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 			pContext->VSSetConstantBuffers(0, 1, &pCB);
+			pContext->PSSetConstantBuffers(0, 1, &pCB);
 			pContext->VSSetShader(pVSDrawTarget, NULL, 0);
 
 			D3D11_VIEWPORT viewport;
@@ -618,7 +614,9 @@ struct SD3D11DeviceAddOn
 			pContext->RSSetState(pRS);
 			pContext->PSSetShader(pPSDrawTarget, NULL, 0);
 			pContext->OMSetRenderTargets(1, &pRTV, NULL);
-			pContext->Draw((UINT)pResult->size() * 3, 0);
+
+			if (!dotShootMode)
+				pContext->Draw((UINT)pResult->size() * 3, 0);
 
 		}
 		contextState.SetToContext(pContext);
@@ -644,13 +642,64 @@ std::map<ID3D11Device*, SD3D11DeviceAddOn*> g_D3D11AddonDatas;
 static void STDMETHODCALLTYPE Hooked_Draw(ID3D11DeviceContext* pContext,
 										  UINT VertexCount, UINT StartVertexLocation)
 {
-	tDraw pfnOriginal = (tDraw)g_DrawHook->GetOriginalPtr(pContext);
-	pfnOriginal(pContext, VertexCount, StartVertexLocation);
+	if (g_DebugMode || g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos)
+	{
+		if (VertexCount == 144)
+		{
+			UINT stencilRef;
+			ID3D11DepthStencilState* pDepthStencilState;
+			pContext->OMGetDepthStencilState(&pDepthStencilState, &stencilRef);
+
+			if (pDepthStencilState != NULL)
+			{
+				D3D11_DEPTH_STENCIL_DESC dsDesc;
+				pDepthStencilState->GetDesc(&dsDesc);
+				D3D11_DEPTH_STENCIL_DESC targetDSDesc;
+				targetDSDesc.DepthEnable = TRUE;
+				targetDSDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+				targetDSDesc.DepthFunc = D3D11_COMPARISON_LESS;
+				targetDSDesc.StencilEnable = TRUE;
+				targetDSDesc.StencilWriteMask = 1;
+				targetDSDesc.StencilReadMask = 1;
+				targetDSDesc.FrontFace.StencilFunc = D3D11_COMPARISON_LESS;
+				targetDSDesc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_ZERO;
+				targetDSDesc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_ZERO;
+				targetDSDesc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_ZERO;
+				targetDSDesc.BackFace.StencilFunc = D3D11_COMPARISON_LESS_EQUAL;
+				targetDSDesc.BackFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+				targetDSDesc.BackFace.StencilDepthFailOp = D3D11_STENCIL_OP_INCR_SAT;
+				targetDSDesc.BackFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+				if (memcmp(&dsDesc, &targetDSDesc, sizeof(D3D11_DEPTH_STENCIL_DESC)) == 0 && stencilRef == 0)
+				{
+					if (g_AutoAimAnalyzer == NULL)
+						g_AutoAimAnalyzer = new AutoAimAnalyzer(pContext);
+
+					g_AutoAimAnalyzer->OnDrawAllyArrow(VertexCount, StartVertexLocation);
+				}
+				SAFE_RELEASE(pDepthStencilState);
+			}
+		}
+	}
+	
+	tDraw pfnOriginal = (tDraw)g_DrawHook->BeginInvokeOriginal(pContext);
+	if (pfnOriginal != NULL)
+	{
+		pfnOriginal(pContext, VertexCount, StartVertexLocation);
+		g_DrawHook->EndInvokeOriginal(pfnOriginal);
+	}
+	else
+	{
+		g_Logger->critical("no original Draw functions {} {}", (void*)pContext,
+						   (void*)g_DrawHook->GetVTableFuncPtr(pContext));
+	}
+
 }
 
 static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext, 
 		UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation)
 {
+	static int i = 0;
+// 	printf("Hooked_DrawIndexed(%06d %03d)\n", i++, GetCurrentThreadId());
 	bool changedDS = false;
 	UINT stencilRef = 0;
 	ID3D11DepthStencilState* pDepthStencilState = NULL;
@@ -715,10 +764,11 @@ static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext,
 		}
 	}
 	
-	tDrawIndexed pfnOriginal = (tDrawIndexed) g_DrawIndexedHook->GetOriginalPtr(pContext);
+	tDrawIndexed pfnOriginal = (tDrawIndexed) g_DrawIndexedHook->BeginInvokeOriginal(pContext);
 	if (pfnOriginal != NULL)
 	{
 		pfnOriginal(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+		g_DrawIndexedHook->EndInvokeOriginal(pfnOriginal);
 	}
 	else
 	{
@@ -742,8 +792,7 @@ static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext)
 	{
 		const int DrawIndexed_VTABLE_INDEX = 12;
 		g_DrawIndexedHook = new VTableHook(DrawIndexed_VTABLE_INDEX, &Hooked_DrawIndexed,
-										   "ID3D11DeviceContext::DrawIndexed(UINT, UINT, UINT)",
-										   32);
+										   "ID3D11DeviceContext::DrawIndexed(UINT, UINT, UINT)", 32);
 	}
 
 	g_DrawIndexedHook->HookObject(pContext);
@@ -761,6 +810,9 @@ static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext)
 static void HookD3D11Device(ID3D11Device** ppDevice)
 {
 	if (ppDevice == NULL || *ppDevice == NULL)
+		return;
+
+	if (g_D3D11AddonDatas.find(*ppDevice) != g_D3D11AddonDatas.end())
 		return;
 
 	g_D3D11AddonDatas[*ppDevice] = new SD3D11DeviceAddOn(*ppDevice);
@@ -792,6 +844,8 @@ HRESULT WINAPI CreateDerivedD3D11DeviceAndSwapChain(
 	_Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel,
 	_Out_opt_ ID3D11DeviceContext** ppImmediateContext)
 {
+// 	GetTimeFromNTPServer();
+
 	g_Logger->info("{:*^50}", "D3D11CreateDeviceAndSwapChain");
 	g_Logger->info("pAdater: {}", (void*) pAdapter);
 	g_Logger->info("DriverType: {}", (UINT)DriverType);
@@ -895,10 +949,12 @@ static HRESULT STDMETHODCALLTYPE Hooked_Present(
 		g_Logger->error("GetDevice from swapchain failed {}", (void*)pSwapChain);
 	}
 
-	tPresent pfn = (tPresent)g_SwapChain_PresentHook->GetOriginalPtr(pSwapChain);
+	tPresent pfn = (tPresent)g_SwapChain_PresentHook->BeginInvokeOriginal(pSwapChain);
 	if (pfn != NULL)
 	{
-		return pfn(pSwapChain, SyncInterval, Flags);
+		HRESULT res = pfn(pSwapChain, SyncInterval, Flags);
+		g_SwapChain_PresentHook->EndInvokeOriginal(pfn);
+		return res;
 	}
 	else
 	{
@@ -929,12 +985,13 @@ static HRESULT STDMETHODCALLTYPE Hooked_CreateSwapChain(
 	DXGI_SWAP_CHAIN_DESC *pDesc, IDXGISwapChain **ppSwapChain)
 {
 	g_Logger->debug("IDXGIFactory::CreateSwapChain");
-	tCreateSwapChain pfn = (tCreateSwapChain)g_DXGIFactory_CreateSwapChainHook->GetOriginalPtr(pFactory);
+	tCreateSwapChain pfn = (tCreateSwapChain)g_DXGIFactory_CreateSwapChainHook->BeginInvokeOriginal(pFactory);
 
 	HRESULT res;
 	if (pfn != NULL)
 	{
 		res = pfn(pFactory, pDevice, pDesc, ppSwapChain);
+		g_DXGIFactory_CreateSwapChainHook->EndInvokeOriginal(pfn);
 	}
 	else
 	{
@@ -953,6 +1010,7 @@ static HRESULT STDMETHODCALLTYPE Hooked_CreateSwapChain(
 		}
 		else
 		{
+			HookD3D11Device(&pD3D11Device);
 			g_D3D11AddonDatas[pD3D11Device]->AddSwapChain(*ppSwapChain);
 			SAFE_RELEASE(pD3D11Device);
 
@@ -1059,8 +1117,35 @@ void initGlobalLog()
 // }
 // 
 
+static BOOL WINAPI Hooked_VirtualProtect(
+	_In_  LPVOID lpAddress,
+	_In_  SIZE_T dwSize,
+	_In_  DWORD  flNewProtect,
+	_Out_ PDWORD lpflOldProtect
+	)
+{
+
+}
+
+
+static BOOL WINAPI Hooked_VirtualProtectEx(
+	_In_  HANDLE hProcess,
+	_In_  LPVOID lpAddress,
+	_In_  SIZE_T dwSize,
+	_In_  DWORD  flNewProtect,
+	_Out_ PDWORD lpflOldProtect
+	)
+{
+
+}
+
+
 bool InitD3D11AndRenderdoc(HMODULE currentModule)
 {
+	AllocConsole();
+	freopen("CONOUT$", "wt", stdout);
+	freopen("CONIN$", "rt", stdin);
+
 	initGlobalLog();
 
 	g_JIT = new asmjit::JitRuntime;

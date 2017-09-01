@@ -1,5 +1,6 @@
 #include "AsmCommon.h"
 #include "CommonUtils.h"
+#include <stack>
 
 extern asmjit::JitRuntime* g_JIT = NULL;
 
@@ -348,27 +349,73 @@ void LogInstructionDetail(spdlog::level::level_enum level, cs_insn* pInsn)
 				  (void*)pInsn->address, bytes, pInsn->mnemonic, pInsn->op_str);
 }
 
-bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
-						 uint8_t** ppRestoreCode, uint32_t* pRestoreCodeSize)
+
+static csh initCapstone()
 {
 	csh handle;
 	cs_err err = cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
 	if (err != CS_ERR_OK)
 	{
 		g_Logger->error("Capstone initialize failed {}", err);
-		return false;
+	}
+	else
+	{
+		cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
 	}
 
-	g_Logger->debug("{:*^128}", "Generating Restore Code");
-	cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+	return handle;
+}
+static csh g_CapstoneHandle = initCapstone();
 
+struct AsmJitCommand 
+{
+	enum CommandOp {
+		POP, MOV_REG_TO_REG, MOV_MEM_TO_REG, PUSH, ADD, SUB
+	};
+
+	void execute(asmjit::X86Assembler& assembler)
+	{
+		switch (op)
+		{
+		case AsmJitCommand::POP:
+			assembler.pop(*reg0);
+			break;
+		case AsmJitCommand::MOV_REG_TO_REG:
+			assembler.mov(*reg0, *reg1);
+			break;
+		case AsmJitCommand::MOV_MEM_TO_REG:
+			assembler.mov(*reg0, mem);
+			break;
+		case AsmJitCommand::PUSH:
+			assembler.push(*reg0);
+			break;
+		case AsmJitCommand::ADD:
+			assembler.add(*reg0, imm);
+			break;
+		case AsmJitCommand::SUB:
+			assembler.sub(*reg0, imm);
+			break;
+		}
+	}
+	CommandOp			 op;
+	const asmjit::X86Gp* reg0;
+	const asmjit::X86Gp* reg1;
+	asmjit::X86Mem		 mem;
+	int64_t				 imm;
+};
+
+static void GenerateRestoreFunction(uint8_t* pFuncAddr, int codeSize, uint8_t* jmpAddrAfterRestore,
+									asmjit::CodeHolder& outCode, void(**pfnVoidFunc)(), 
+									PrologueJmpPatch* jmpPatch)
+{
+	g_Logger->debug("{:*^128}", "Generating Restore Code");
 	size_t size = codeSize + 16 - 1;
 	const uint8_t* pCode = pFuncAddr;
 	uint64_t pAddr = (uint64_t)pFuncAddr;
 
 	g_Logger->debug("Original function prologue: ");
 	cs_insn* pInstructions;
-	size_t count = cs_disasm(handle, pCode, size, pAddr, 0, &pInstructions);
+	size_t count = cs_disasm(g_CapstoneHandle, pCode, size, pAddr, 0, &pInstructions);
 	size_t effectiveInsnCount;
 	for (effectiveInsnCount = 0; effectiveInsnCount < count; ++effectiveInsnCount)
 	{
@@ -408,10 +455,16 @@ bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 	// 	regs[X86_REG_R15] = RegState(false);
 
 	using namespace asmjit;
-	CodeHolder code;                        // Holds code and relocation information.
-	code.init(g_JIT->getCodeInfo());        // Initialize to the same arch as JIT runtime.
-	X86Assembler assembler(&code);          // Create and attach X86Assembler to `code`.
+	outCode.init(g_JIT->getCodeInfo());        // Initialize to the same arch as JIT runtime.
+	std::stack<AsmJitCommand> commands;
+	if (jmpPatch != NULL)
+	{
+		jmpPatch->jmpTargetAddr = NULL;
+		jmpPatch->oldJmpTarget = 0;
+		jmpPatch->newJmpTarget = 0;
+	}
 
+	uint64_t callRetAddr = 0;
 	int64_t curRSP = 0;
 	int64_t curRBP = 0;
 	for (size_t i = 0; i < effectiveInsnCount; ++i)
@@ -427,15 +480,17 @@ bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 			if (x86->op_count == 1 && ops[0].reg == reg0)
 			{
 				curRSP -= GetRegSize(ops[0].reg);
-				assembler.pop(ToJitReg(ops[0].reg));
-				handled = true;
+
+				AsmJitCommand command;
+				command.op = AsmJitCommand::POP;
+				command.reg0 = &ToJitReg(ops[0].reg);
+				commands.push(command);
 			}
 		}
 		else if (strcmp(pInstructions[i].mnemonic, "mov") == 0)
 		{
 			if (reg0 != X86_REG_INVALID && reg1 != X86_REG_INVALID)
 			{ // move between regs
-				// mov ops[1].reg, ops[0].reg
 				handled = true;
 
 				if (reg0 == X86_REG_RBP)
@@ -447,7 +502,14 @@ bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 				}
 
 				if (handled)
-					assembler.mov(ToJitReg(ops[1].reg), ToJitReg(ops[0].reg));
+				{
+					// mov ops[1].reg, ops[0].reg
+					AsmJitCommand command;
+					command.op = AsmJitCommand::MOV_REG_TO_REG;
+					command.reg0 = &ToJitReg(ops[1].reg);
+					command.reg1 = &ToJitReg(ops[0].reg);
+					commands.push(command);
+				}
 			}
 			else if (x86->op_count > 0 && ops[0].type == X86_OP_MEM)
 			{ // save reg into stack
@@ -464,8 +526,11 @@ bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 
 						// mov ops[1].reg, [rsp + stackPos]
 
-						X86Mem mem(x86::rsp, (int32_t)stackPos);
-						assembler.mov(ToJitReg(ops[1].reg), mem);
+						AsmJitCommand command;
+						command.op = AsmJitCommand::MOV_MEM_TO_REG;
+						command.reg0 = &ToJitReg(ops[1].reg);
+						command.mem = X86Mem(x86::rsp, (int32_t)stackPos);
+						commands.push(command);
 						handled = true;
 					}
 				}
@@ -477,17 +542,16 @@ bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 			{
 				// add rsp, imm or add rbp, imm
 				if (reg0 == X86_REG_RSP)
-				{
 					curRSP -= ops[1].imm;
-					assembler.add(x86::rsp, ops[1].imm);
-					handled = true;
-				}
 				else if (reg0 == X86_REG_RBP)
-				{
 					curRBP -= ops[1].imm;
-					assembler.add(x86::rbp, ops[1].imm);
-					handled = true;
-				}
+
+				AsmJitCommand command;
+				command.op = AsmJitCommand::ADD;
+				command.reg0 = &ToJitReg(reg0);
+				command.imm = ops[1].imm;
+				commands.push(command);
+				handled = true;
 			}
 		}
 		else if (strcmp(pInstructions[i].mnemonic, "add") == 0)
@@ -496,23 +560,50 @@ bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 			{
 				// sub rsp, imm or sub rbp, imm
 				if (reg0 == X86_REG_RSP)
-				{
 					curRSP += ops[1].imm;
-					assembler.sub(x86::rsp, ops[1].imm);
-					handled = true;
-				}
 				else if (reg0 == X86_REG_RBP)
-				{
 					curRBP += ops[1].imm;
-					assembler.sub(x86::rbp, ops[1].imm);
-					handled = true;
-				}
+
+				AsmJitCommand command;
+				command.op = AsmJitCommand::SUB;
+				command.reg0 = &ToJitReg(reg0);
+				command.imm = ops[1].imm;
+				commands.push(command);
+				handled = true;
 			}
 		}
 		else if (strcmp(pInstructions[i].mnemonic, "lea") == 0)
 		{
 			if (reg0 != X86_REG_INVALID && reg0 != X86_REG_RBP && reg0 != X86_REG_RSP)
 				handled = true;
+		}
+		else if (strcmp(pInstructions[i].mnemonic, "call") == 0)
+		{
+			curRSP -= sizeof(void*);
+			AsmJitCommand command;
+			command.op = AsmJitCommand::ADD;
+			command.reg0 = &x86::rsp;
+			command.imm = sizeof(void*);
+			commands.push(command);
+			handled = true;
+		}
+
+		if (jmpPatch != NULL)
+		{
+			if (strcmp(pInstructions[i].mnemonic, "call") == 0 ||
+				strcmp(pInstructions[i].mnemonic, "jmp") == 0)
+			{
+				if (x86->op_count > 0 && x86->operands[0].type == X86_OP_MEM)
+				{
+					if (x86->operands[0].mem.base == X86_REG_RIP)
+					{
+						callRetAddr = pInstructions[i].address + pInstructions[i].size;
+						jmpPatch->jmpTargetAddr = (uint64_t*) (callRetAddr + x86->operands[0].mem.disp);
+						jmpPatch->oldJmpTarget = *jmpPatch->jmpTargetAddr;
+						break;
+					}
+				}
+			}
 		}
 
 		if (!handled)
@@ -522,29 +613,74 @@ bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
 	}
 	cs_free(pInstructions, count);
 
+	X86Assembler assembler(&outCode);          // Create and attach X86Assembler to `code`.
+
+	if (jmpPatch != NULL && jmpPatch->jmpTargetAddr != NULL)
+	{
+		asmjit::Label label = assembler.newLabel();
+
+		assembler.push(x86::rax);
+		assembler.mov(x86::rax, callRetAddr);
+		assembler.cmp(x86::ptr(x86::rsp, 8), x86::rax);
+		{
+			assembler.je(label);
+			assembler.pop(x86::rax);
+			assembler.jmp(jmpPatch->oldJmpTarget);
+		}
+
+		assembler.bind(label);
+		assembler.pop(x86::rax);
+// 		assembler.jne(jmpPatch->oldJmpTarget);
+	}
+
+	while (!commands.empty())
+	{
+		commands.top().execute(assembler);
+		commands.pop();
+	}
+
+	if (jmpAddrAfterRestore != NULL)
+	{
+		assembler.jmp((uint64_t) jmpAddrAfterRestore);
+	}
+
+	asmjit::Error err = g_JIT->add(pfnVoidFunc, &outCode);
+	if (err != asmjit::kErrorOk)
+	{
+		g_Logger->error("Asmjit create function error {}", err);
+	}
+
+	if (jmpPatch != NULL && jmpPatch->jmpTargetAddr != NULL)
+	{
+		jmpPatch->newJmpTarget = (uint64_t)(*pfnVoidFunc);
+	}
+}
+
+bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize, uint8_t* jmpAddrAfterRestore,
+						 uint8_t** ppRestoreCode, uint32_t* pRestoreCodeSize, 
+						 PrologueJmpPatch* jmpPatch)
+{
+	asmjit::CodeHolder code;                        // Holds code and relocation information.
 	void(*pfnVoidFunc)();
-	g_JIT->add(&pfnVoidFunc, &code);
+	GenerateRestoreFunction(pFuncAddr, codeSize, jmpAddrAfterRestore, code, &pfnVoidFunc, jmpPatch);
 
 	*pRestoreCodeSize = (uint32_t)code.getCodeSize();
-	count = cs_disasm(handle, (uint8_t*)pfnVoidFunc, *pRestoreCodeSize,
-					  (uint64_t)pfnVoidFunc, 0, &pInstructions);
+	*ppRestoreCode = new uint8_t[*pRestoreCodeSize];
+	memcpy(*ppRestoreCode, (uint8_t*)pfnVoidFunc, *pRestoreCodeSize);
+
+	cs_insn* pInstructions;
+	size_t count = cs_disasm(g_CapstoneHandle, (uint8_t*)pfnVoidFunc, *pRestoreCodeSize,
+							 (uint64_t)pfnVoidFunc, 0, &pInstructions);
 
 	g_Logger->debug("Generated function epilogue: ");
-	*ppRestoreCode = new uint8_t[*pRestoreCodeSize];
-	for (size_t i = 0, codeOff = 0; i < count; ++i)
-	{
-		size_t idx = count - i - 1;
-
-		// no rip related instructions, so we can do the copy safely.
-		memcpy((*ppRestoreCode) + codeOff, pInstructions[idx].bytes, pInstructions[idx].size);
-		codeOff += pInstructions[idx].size;
-
-		LogInstructionDetail(spdlog::level::debug, &pInstructions[idx]);
-	}
+	for (size_t i = 0; i < count; ++i)
+		LogInstructionDetail(spdlog::level::debug, &pInstructions[i]);
 	cs_free(pInstructions, count);
-	g_JIT->release(pfnVoidFunc);
 
 	g_Logger->debug("{:*^128}", "");
+
+	if (jmpPatch == NULL || jmpPatch->jmpTargetAddr == NULL)
+		g_JIT->release(pfnVoidFunc);
 
 	return true;
 }

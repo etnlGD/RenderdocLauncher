@@ -133,9 +133,9 @@
       <Optimization>Disabled</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>ASMJIT_STATIC;WIN32;NDEBUG;_WINDOWS;_USRDLL;RENDERDOCLAUNCHER_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>CURL_STATICLIB;_CRT_SECURE_NO_WARNINGS;ASMJIT_STATIC;WIN32;NDEBUG;_WINDOWS;_USRDLL;RENDERDOCLAUNCHER_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
-      <AdditionalIncludeDirectories>$(SolutionDir)\PolyHook;$(SolutionDir)\PolyHook\Capstone\include;$(SolutionDir)\spdlog\include;$(SolutionDir)\asmjit\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)\PolyHook;$(SolutionDir)\PolyHook\Capstone\include;$(SolutionDir)\spdlog\include;$(SolutionDir)\asmjit\src;$(SolutionDir)\curl\include\;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PrecompiledHeaderFile />
       <PrecompiledHeaderOutputFile />
       <DisableSpecificWarnings>4819</DisableSpecificWarnings>
@@ -146,8 +146,8 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <ModuleDefinitionFile>D3D11.def</ModuleDefinitionFile>
-      <AdditionalLibraryDirectories>$(SolutionDir)\PolyHook\capstone\msvc\x64\Release;$(SolutionDir)\asmjit\build_vs2013_x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>asmjit.lib;capstone.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)\PolyHook\capstone\msvc\x64\Release;$(SolutionDir)\asmjit\build_vs2013_x64\Release;$(SolutionDir)\curl\build\lib\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>Wldap32.Lib;Ws2_32.lib;libcurl.lib;asmjit.lib;capstone.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <IgnoreSpecificDefaultLibraries>libcmt.lib;</IgnoreSpecificDefaultLibraries>
     </Link>
     <PostBuildEvent>
@@ -160,9 +160,11 @@
   <ItemGroup>
     <ClInclude Include="AsmCommon.h" />
     <ClInclude Include="AutoAimAnalyzer.h" />
+    <ClInclude Include="AutoAimPerformer.h" />
     <ClInclude Include="CommonUtils.h" />
     <ClInclude Include="DeviceContextState.h" />
     <ClInclude Include="HookUtil.h" />
+    <ClInclude Include="NTPClient.h" />
     <ClInclude Include="RenderdocLauncher.h" />
     <ClInclude Include="shader_obj\DrawTargetPS.h" />
     <ClInclude Include="shader_obj\DrawTargetVS.h" />
@@ -170,6 +172,7 @@
   <ItemGroup>
     <ClCompile Include="AsmCommon.cpp" />
     <ClCompile Include="AutoAimAnalyzer.cpp" />
+    <ClCompile Include="AutoAimPerformer.cpp" />
     <ClCompile Include="CommonUtils.cpp" />
     <ClCompile Include="D3D11Exports.cpp" />
     <ClCompile Include="DeviceContextState.cpp" />
@@ -188,6 +191,7 @@
       </PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="HookUtil.cpp" />
+    <ClCompile Include="NTPClient.cpp" />
     <ClCompile Include="RenderdocLauncher.cpp" />
   </ItemGroup>
   <ItemGroup>

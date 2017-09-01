@@ -74,7 +74,7 @@ void DetourHookInfo::HackOverwatch(uint8_t* pTargetFunc)
 	{
 		uint8_t* restoreCode;
 		uint32_t restoreCodeSize;
-		GenerateRestoreCode(pTargetFunc, 32, &restoreCode, &restoreCodeSize);
+		GenerateRestoreCode(pTargetFunc, 32, NULL, &restoreCode, &restoreCodeSize, NULL);
 
 		PLH::Detour* pDetour = static_cast<PLH::Detour*>(m_pDetour);
 		pDetour->m_PreserveSize = 32;
@@ -94,7 +94,7 @@ VTableHook::~VTableHook()
 {
 	for (auto it = AllDetours.begin(); it != AllDetours.end(); ++it)
 	{
-		PLH::Detour* pDetour = static_cast<PLH::Detour*>(it->second);
+		PLH::Detour* pDetour = static_cast<PLH::Detour*>(it->second.detour);
 		delete pDetour;
 	}
 }
@@ -108,39 +108,55 @@ void VTableHook::HookObject(void* pObject)
 	uint8_t* pSourceFunc = vtable[VTableIndex];
 	if (AllDetours.find(pSourceFunc) == AllDetours.end())
 	{
-		PLH::Detour* pDetour = new PLH::Detour;
-
+		HookData hookData;
+		uint8_t* restoreCode = NULL;
+		uint32_t restoreCodeSize = 0;
 		if (PreserveSize > 0)
 		{
-			pDetour->m_PreserveSize = PreserveSize;
-			GenerateRestoreCode(pSourceFunc, PreserveSize,
-								&pDetour->m_RestoreCode,
-								&pDetour->m_RestoreCodeSize);
+			GenerateRestoreCode(pSourceFunc, PreserveSize, HookFuncPtr,
+								&restoreCode, &restoreCodeSize, &hookData.jmpPatch);
 		}
 
-		pDetour->SetupHook(pSourceFunc, HookFuncPtr);
-
-// 		uint32_t jmpOffset = pDetour->CalculateLength(pSourceFunc, PreserveSize);
-// 		PLH::VTableSwap* pVTableSwap = new PLH::VTableSwap;
-// 		pVTableSwap->SetupHook((uint8_t*)pObject, VTableIndex, pSourceFunc + jmpOffset);
-// 		pVTableSwap->Hook();
-
-		if (!pDetour->Hook())
+		if (hookData.jmpPatch.jmpTargetAddr == NULL) // no jmp or call in function prologue, as usual
 		{
-			g_Logger->warn("Detour virtual function {} @ {} from {} to {} failed",
-						   FuncName, VTableIndex, (void*)pSourceFunc, (void*)HookFuncPtr);
+			PLH::Detour* pDetour = new PLH::Detour;
+			pDetour->m_RestoreCode = restoreCode;
+			pDetour->m_RestoreCodeSize = restoreCodeSize;
+			pDetour->m_PreserveSize = PreserveSize;
+			pDetour->SetupHook(pSourceFunc, HookFuncPtr);
+			if (!pDetour->Hook())
+			{
+				g_Logger->warn("Detour virtual function {} @ {} from {} to {} failed",
+							   FuncName, VTableIndex, (void*)pSourceFunc, (void*)HookFuncPtr);
+			}
+			else
+			{
+				g_Logger->debug("Detour virtual function {} @ {} from {} to {} succeed",
+								FuncName, VTableIndex, (void*)pSourceFunc, (void*)HookFuncPtr);
+			}
+
+			hookData.detour = pDetour;
+
+			DWORD oldProtection;
+			VirtualProtect(pSourceFunc, 32, PAGE_EXECUTE, &oldProtection);
+			printf("oldProtection: %d\n", oldProtection);
 		}
 		else
 		{
-			g_Logger->debug("Detour virtual function {} @ {} from {} to {} succeed",
-							FuncName, VTableIndex, (void*)pSourceFunc, (void*)HookFuncPtr);
-		}
+			PLH::MemoryProtect memProtect(hookData.jmpPatch.jmpTargetAddr, sizeof(uint64_t), PAGE_EXECUTE_READWRITE);
+			*hookData.jmpPatch.jmpTargetAddr = hookData.jmpPatch.newJmpTarget;
+			printf("Detour function with jmp/call in prologue: %s\n", FuncName.c_str());
+			g_Logger->debug("Detour virtual function {} @ {} from {} to {} succeed (jmp info {} {})",
+							FuncName, VTableIndex, (void*)pSourceFunc, (void*)HookFuncPtr, 
+							(void*)hookData.jmpPatch.oldJmpTarget, (void*)hookData.jmpPatch.newJmpTarget);
 
-		AllDetours[pSourceFunc] = pDetour;
+		}
+		
+		AllDetours[pSourceFunc] = hookData;
 	}
 }
 
-uint8_t* VTableHook::GetOriginalPtr(void* pObject)
+uint8_t* VTableHook::BeginInvokeOriginal(void* pObject)
 {
 	uint8_t* pSourceFunc = GetVTableFuncPtr(pObject);
 	if (pSourceFunc == NULL)
@@ -149,11 +165,28 @@ uint8_t* VTableHook::GetOriginalPtr(void* pObject)
 	auto it = AllDetours.find(pSourceFunc);
 	if (it != AllDetours.end())
 	{
-		PLH::Detour* pDetour = static_cast<PLH::Detour*>(it->second);
-		return pDetour->GetOriginal<uint8_t*>();
+		PLH::Detour* pDetour = static_cast<PLH::Detour*>(it->second.detour);
+		if (pDetour != NULL)
+			return pDetour->GetOriginal<uint8_t*>();
+
+		// remove jmp patch, and return source func ptr.
+		PLH::MemoryProtect memProtect(it->second.jmpPatch.jmpTargetAddr, sizeof(uint64_t), PAGE_EXECUTE_READWRITE);
+		*it->second.jmpPatch.jmpTargetAddr = it->second.jmpPatch.oldJmpTarget;
+		return it->first;
 	}
 
 	return NULL;
+}
+
+void VTableHook::EndInvokeOriginal(void* pSourceFunc)
+{
+	// add jmp patch
+	auto it = AllDetours.find((uint8_t*)pSourceFunc);
+	if (it != AllDetours.end() && it->second.jmpPatch.jmpTargetAddr != NULL)
+	{
+		PLH::MemoryProtect memProtect(it->second.jmpPatch.jmpTargetAddr, sizeof(uint64_t), PAGE_EXECUTE_READWRITE);
+		*it->second.jmpPatch.jmpTargetAddr = it->second.jmpPatch.newJmpTarget;
+	}
 }
 
 uint8_t* VTableHook::GetVTableFuncPtr(void* pObject)

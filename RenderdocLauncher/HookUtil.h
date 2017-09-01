@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <map>
+#include "AsmCommon.h"
 
 struct DetourHookInfo
 {
@@ -45,12 +46,19 @@ public:
 
 	void HookObject(void* pObject);
 
-	uint8_t* GetOriginalPtr(void* pObject);
+	uint8_t* BeginInvokeOriginal(void* pObject);
+	void EndInvokeOriginal(void* pSourceFunc);
 
 	uint8_t* GetVTableFuncPtr(void* pObject);
 
 private:
-	std::map<uint8_t*, void*> AllDetours;
+	struct HookData 
+	{
+		void* detour;
+		PrologueJmpPatch jmpPatch;
+		HookData() : detour(NULL) {}
+	};
+	std::map<uint8_t*, HookData> AllDetours;
 };
 
 void* CreateIATHook(const char* LibraryName, const char* SrcFunc, uint8_t* Dest, const char* Module);
