@@ -22,16 +22,18 @@
 #include "NTPClient.h"
 #include "AutoAimPerformer.h"
 
-static bool g_RenderdocMode = false;
-extern bool g_DebugMode = true;
+static bool g_RenderdocMode = true;
+extern bool g_DebugMode = false;
 
 extern std::wstring g_HookedProcessName = L"";
 extern HMODULE hD3D11 = 0;
 extern HMODULE hCurrentModule = 0;
 extern HMODULE hRenderdoc = 0;
 extern HMODULE hDXGI = 0;
+extern WORD g_ShootKey = VK_MBUTTON;
 
 std::vector<DetourHookInfo> sDetourHooks;
+
 
 // // 保证 Renderdoc 始终调用真正的 d3d11 API
 static FARPROC WINAPI Hooked_GetProcAddress(_In_ HMODULE hModule, _In_ LPCSTR lpProcName)
@@ -88,27 +90,6 @@ static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext);
 static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext,
 												 UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
 
-static size_t FindPrevCall(uint8_t* pRetAddr, csh handle)
-{
-	for (size_t callInstSize = 1; callInstSize <= 16; ++callInstSize)
-	{
-		const uint8_t* pCode = (uint8_t*)pRetAddr - callInstSize;
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, pCode, callInstSize, (uint64_t)pCode, 0, &pInstructions);
-		if (count == 1 && pInstructions[0].size == callInstSize &&
-			strcmp(pInstructions[0].mnemonic, "call") == 0)
-		{
-			g_Logger->info("++ find call/jmp instruction before retAddr: ");
-			LogInstructionDetail(spdlog::level::info, &pInstructions[0]);
-			cs_free(pInstructions, count);
-			return callInstSize;
-		}
-		cs_free(pInstructions, count);
-	}
-
-	return 0;	// not found.
-}
-
 static void LogInstructions(uint8_t* pAddr, csh handle)
 {
 	cs_insn* pInstructions;
@@ -119,183 +100,6 @@ static void LogInstructions(uint8_t* pAddr, csh handle)
 	{
 		LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
 	}
-}
-
-std::set<void*> DrawIndexedRetAddr;
-std::set<void*> DrawIndexedTailJmps;
-static uint8_t* DetourCaller(csh* pHandle, uint8_t* pCaller, size_t callInstSize, bool tailJmp)
-{
-	csh handle;
-	if (pHandle == NULL)
-	{
-		cs_err err = cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
-		if (err != CS_ERR_OK)
-		{
-			g_Logger->error("Capstone initialize failed {}", err);
-			return NULL;
-		}
-	}
-	else
-	{
-		handle = *pHandle;
-	}
-	
-	uint8_t* pTrampoline;
-	do { // allocate trampoline
-		size_t trampolineSize = 64;
-		size_t delta;
-		pTrampoline = (uint8_t*)PLH::Tools::AllocateWithin2GB(pCaller, trampolineSize, delta);
-		if (pTrampoline == NULL)
-		{
-			g_Logger->error("Diff between pCaller({}) and Hooked_DrawIndexed({}) is too long, "
-							"and attempt to allocate within 2GB failed",
-							(void*)pCaller, (void*)&Hooked_DrawIndexed);
-
-			return NULL;
-		}
-
-		DWORD oldProtection;
-		VirtualProtect(pTrampoline, trampolineSize, PAGE_EXECUTE_READWRITE, &oldProtection);
-
-		uint8_t detour[] = {
-			0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
-			0xFF, 0x15, 0xF2, 0xFF, 0xFF, 0xFF,			// call hooked function
-			0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-			0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-			0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,			// jmp back to original function
-			0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
-		};
-
-		if (tailJmp)
-			detour[9] = 0x25; // change 'call' to 'jmp'
-
-		memcpy(pTrampoline, detour, sizeof(detour));
-		*(uintptr_t*)&pTrampoline[0] = (uintptr_t)&Hooked_DrawIndexed;
-
-		if (!tailJmp)
-			DrawIndexedRetAddr.insert(pTrampoline + 14);
-		else
-			DrawIndexedTailJmps.insert(pCaller);
-// 		VirtualProtect(pTrampoline, trampolineSize, oldProtection, &oldProtection);
-	} while (0);
-
-
-	do { // log call/jmp instruction
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, pCaller, callInstSize, (uint64_t)pCaller, 0, &pInstructions);
-		g_Logger->info("++ detour call/jmp instruction: ");
-		LogInstructionDetail(spdlog::level::info, &pInstructions[0]);
-		cs_free(pInstructions, count);
-	} while (0);
-
-
-	uint8_t jmpCode[] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
-	const size_t jmpCodeLen = sizeof(jmpCode);
-
-	// patch relative address of jmp to trampoline
-	*(int32_t*)&jmpCode[1] = (int32_t)((pTrampoline + 8) - (pCaller + jmpCodeLen));
-
-	uint8_t* pRetAddr = pCaller + callInstSize;
-
-	size_t relocSrcSize = 0;
-	if (jmpCodeLen > callInstSize)
-	{ // relocate rest affected code
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, (uint8_t*)pRetAddr,
-									(jmpCodeLen - callInstSize) + 16,
-									(uint64_t)pRetAddr, 0, &pInstructions);
-
-		g_Logger->info(tailJmp ? "++ override instructions" : "++ relocating instructions:");
-		for (size_t i = 0; i < count; ++i)
-		{
-			relocSrcSize += pInstructions[i].size;
-			LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
-			if ((relocSrcSize + callInstSize) >= jmpCodeLen)
-			{
-				memcpy(pTrampoline + 14, pRetAddr, relocSrcSize);
-
-				// TODO relocate these code
-				break;
-			}
-		}
-
-		cs_free(pInstructions, count);
-	}
-
-	size_t hookSrcLen = callInstSize + relocSrcSize;
-
-	// patch trampoline return address
-	*(uintptr_t*)&pTrampoline[36] = (uintptr_t)pRetAddr + relocSrcSize;
-
-	do { // change original function call
-		DWORD oldProtection;
-
-		MEMORY_BASIC_INFORMATION bi;
-		size_t queryRes = VirtualQuery(pCaller, &bi, sizeof(MEMORY_BASIC_INFORMATION));
-		g_Logger->info("VQ: {} {} {} {} {} {} {} {}", queryRes, bi.BaseAddress, bi.AllocationBase, 
-					   bi.AllocationProtect, bi.RegionSize, bi.State, bi.Protect, bi.Type);
-
-		BOOL b = VirtualProtect(pCaller, hookSrcLen, PAGE_READONLY, &oldProtection);
-
-		g_Logger->info("{} {} {} {} {}", hookSrcLen, jmpCodeLen, b, oldProtection, GetLastError());
-		memcpy(pCaller, jmpCode, jmpCodeLen);
-		g_Logger->info("1");
-
-		// fill with nop
-		for (size_t rest = jmpCodeLen; rest < hookSrcLen; ++rest)
-			pCaller[rest] = 0x90;
-		g_Logger->info("1");
-
-		VirtualProtect(pCaller, callInstSize, oldProtection, &oldProtection);
-	} while (0);
-
-	{ // log modified instructions
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, pCaller, hookSrcLen, (uint64_t)pCaller, 0, &pInstructions);
-		g_Logger->info("++ modified call instructions: ");
-		for (size_t i = 0; i < count; ++i)
-			LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
-		cs_free(pInstructions, count);
-	}
-
-	{ // log trampoline instructions
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, pTrampoline + 8, tailJmp ? 6 : 28, 
-								 (uint64_t)pTrampoline + 8, 0, &pInstructions);
-		g_Logger->info("++ generated trampoline instructions: ");
-		for (size_t i = 0; i < count; ++i)
-			LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
-		cs_free(pInstructions, count);
-	}
-
-	return pTrampoline;
-}
-
-static void DetourDrawIndexedRetAddr(void** ppRetAddr)
-{
-	void* pRetAddr = *ppRetAddr;
-
-	csh handle;
-	cs_err err = cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
-	if (err != CS_ERR_OK)
-	{
-		g_Logger->error("Capstone initialize failed {}", err);
-		return;
-	}
-
-	// find last call instruction
-	size_t callInstSize = FindPrevCall((uint8_t*)pRetAddr, handle);
-	if (callInstSize <= 0)
-	{
-		g_Logger->error("DrawIndexed: can't find call instruction before retAddr");
-		return;
-	}
-
-	uint8_t* pPrevCall = (uint8_t*)pRetAddr - callInstSize;
-	uint8_t* pTrampoline = DetourCaller(&handle, pPrevCall, callInstSize, false);
-
-	if (pTrampoline)
-		*ppRetAddr = pTrampoline + 14;
 }
 
 static AutoAimAnalyzer* g_AutoAimAnalyzer;
@@ -445,19 +249,7 @@ struct SD3D11DeviceAddOn
 		{
 			const float minRatio = 0.7f, maxRatio = 0.9f;
 
-			if (dotShootMode)
-			{
-				static double ratio = 0;
-				if ((ratio += 0.02345678) > 100)
-					ratio = 0;
-
-				ratio = fmod(ratio, (double) maxRatio - minRatio);
-				g_AutoAimAnalyzer->SetShootPosRatio((float) ratio + minRatio);
-			}
-			else
-			{
-				g_AutoAimAnalyzer->SetShootPosRatio(0.7f);
-			}
+			g_AutoAimAnalyzer->SetShootPosRatio(0.7f);
 			g_AutoAimAnalyzer->OnFrameEnd();
 			pResult = &g_AutoAimAnalyzer->GetResult();
 		}
@@ -474,19 +266,19 @@ struct SD3D11DeviceAddOn
 			BackBufferHeight = BackBufferDesc.Height;
 		}
 
-		static KeyState middleKeyState(VK_MBUTTON);
-		if (middleKeyState.update() == KeyState::KEY_DOWN)
-		{
-			INPUT mouseMove;
-			mouseMove.type = INPUT_MOUSE;
-			mouseMove.mi.dx = 2250;// (LONG)((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
-			mouseMove.mi.dy = 0;
-			mouseMove.mi.mouseData = 0;
-			mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
-			mouseMove.mi.time = 0;
-			mouseMove.mi.dwExtraInfo = NULL;
-			SendInput(1, &mouseMove, sizeof(INPUT));
-		}
+// 		static KeyState middleKeyState(VK_MBUTTON);
+// 		if (middleKeyState.update() == KeyState::KEY_DOWN)
+// 		{
+// 			INPUT mouseMove;
+// 			mouseMove.type = INPUT_MOUSE;
+// 			mouseMove.mi.dx = 2250;// (LONG)((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
+// 			mouseMove.mi.dy = 0;
+// 			mouseMove.mi.mouseData = 0;
+// 			mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
+// 			mouseMove.mi.time = 0;
+// 			mouseMove.mi.dwExtraInfo = NULL;
+// 			SendInput(1, &mouseMove, sizeof(INPUT));
+// 		}
 
 		static KeyState fKeyState('F');
 		static int aimbotState = 0;
@@ -501,42 +293,40 @@ struct SD3D11DeviceAddOn
 		{
 			if (aimbotState != 0)
 			{
+				const int INVALID_AIM_FRAMES = -1000;
 				static KeyState leftKeyState(VK_LBUTTON);
-				static int aimFrames = -1000;
-				if (leftKeyState.update() == KeyState::KEY_DOWN)
+				static int aimFrames = INVALID_AIM_FRAMES;
+				int lbuttonState = leftKeyState.update();
+				if (lbuttonState == KeyState::KEY_DOWN)
 				{
-					if (aimFrames < -1)
+					if (aimFrames == INVALID_AIM_FRAMES)
 						aimFrames = 6;
 				}
 
 				if (aimFrames > 0)
 				{
 					enableAimbot = true;
+					--aimFrames;
 				}
 				else if (aimFrames == 0)
 				{
 					INPUT shootDown;
-					shootDown.type = INPUT_KEYBOARD;
-					shootDown.ki.wVk = 'B';
-					shootDown.ki.wScan = 0;
-					shootDown.ki.dwFlags = 0;
-					shootDown.ki.time = 0;
-					shootDown.ki.dwExtraInfo = 0;
+					shootDown.type = INPUT_MOUSE;
+					memset(&shootDown.mi, 0, sizeof(shootDown.mi));
+					shootDown.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN;
 					SendInput(1, &shootDown, sizeof(INPUT));
-				}
-				else if (aimFrames == -1)
-				{
-					INPUT shootDown;
-					shootDown.type = INPUT_KEYBOARD;
-					shootDown.ki.wVk = 'B';
-					shootDown.ki.wScan = 0;
-					shootDown.ki.dwFlags = KEYEVENTF_KEYUP;
-					shootDown.ki.time = 0;
-					shootDown.ki.dwExtraInfo = 0;
-					SendInput(1, &shootDown, sizeof(INPUT));
+					--aimFrames;
 				}
 
-				--aimFrames;
+				if (lbuttonState == KeyState::KEY_UP && aimFrames == -1)
+				{
+					INPUT shootDown;
+					shootDown.type = INPUT_MOUSE;
+					memset(&shootDown.mi, 0, sizeof(shootDown.mi));
+					shootDown.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+					SendInput(1, &shootDown, sizeof(INPUT));
+					aimFrames = INVALID_AIM_FRAMES;
+				}
 			}
 		}
 		else

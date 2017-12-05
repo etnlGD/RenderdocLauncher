@@ -21,6 +21,11 @@ DetourHookInfo::DetourHookInfo(HMODULE targetModule, LPCSTR targetFunc, FARPROC 
 {
 }
 
+bool isOverwatch()
+{
+	return g_DebugMode || g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos;
+}
+
 bool DetourHookInfo::InstallHook()
 {
 	uint8_t* pTargetFunc = (uint8_t*)GetProcAddress(hTargetModule, sTargetFunc);
@@ -39,7 +44,7 @@ bool DetourHookInfo::InstallHook()
 	}
 
 	// Overwatch checks top 32 bytes of these functions, so do some hack.
-	if (g_DebugMode || g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos)
+	if (isOverwatch())
 		HackOverwatch(pTargetFunc);
 
 	PLH::Detour* pDetour = static_cast<PLH::Detour*>(m_pDetour);
@@ -111,6 +116,7 @@ void VTableHook::HookObject(void* pObject)
 		HookData hookData;
 		uint8_t* restoreCode = NULL;
 		uint32_t restoreCodeSize = 0;
+		uint32_t PreserveSize = isOverwatch()  ? this->PreserveSize : 0;
 		if (PreserveSize > 0)
 		{
 			GenerateRestoreCode(pSourceFunc, PreserveSize, HookFuncPtr,

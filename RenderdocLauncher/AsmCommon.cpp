@@ -497,8 +497,6 @@ static void GenerateRestoreFunction(uint8_t* pFuncAddr, int codeSize, uint8_t* j
 				{
 					if (reg1 == X86_REG_RSP)
 						curRBP = curRSP;
-					else
-						handled = false;
 				}
 
 				if (handled)
@@ -530,6 +528,18 @@ static void GenerateRestoreFunction(uint8_t* pFuncAddr, int codeSize, uint8_t* j
 						command.op = AsmJitCommand::MOV_MEM_TO_REG;
 						command.reg0 = &ToJitReg(ops[1].reg);
 						command.mem = X86Mem(x86::rsp, (int32_t)stackPos);
+						commands.push(command);
+						handled = true;
+					}
+				}
+				else if (reg1 != X86_REG_INVALID)
+				{
+					if (ops[0].mem.segment == X86_REG_INVALID && ops[0].mem.index == X86_REG_INVALID)
+					{
+						AsmJitCommand command;
+						command.op = AsmJitCommand::MOV_MEM_TO_REG;
+						command.reg0 = &ToJitReg(ops[1].reg);
+						command.mem = X86Mem(ToJitReg((x86_reg) memBase), (int32_t)ops[0].mem.disp);
 						commands.push(command);
 						handled = true;
 					}
