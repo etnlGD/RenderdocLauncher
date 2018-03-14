@@ -110,7 +110,8 @@ void VTableHook::HookObject(void* pObject)
 	{
 		PLH::Detour* pDetour = new PLH::Detour;
 
-		if (PreserveSize > 0)
+		if ((g_DebugMode || g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos) && 
+			PreserveSize > 0)
 		{
 			pDetour->m_PreserveSize = PreserveSize;
 			GenerateRestoreCode(pSourceFunc, PreserveSize,

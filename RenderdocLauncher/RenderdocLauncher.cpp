@@ -1131,6 +1131,7 @@ bool InitD3D11AndRenderdoc(HMODULE currentModule)
 
 	if (g_RenderdocMode)
 	{
+		g_Logger->info("start loading renderdoc.dll");
 		hRenderdoc = LoadLibrary(L"renderdoc.dll");
 		if (hRenderdoc == NULL)
 		{
