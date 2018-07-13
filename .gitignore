@@ -4,3 +4,4 @@
 *.opensdf
 *.vcxproj.user
 /*.suo
+Release/

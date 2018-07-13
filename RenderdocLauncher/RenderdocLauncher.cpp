@@ -20,8 +20,10 @@
 
 #include "PolyHook/PolyHookTools.hpp"
 #include <Psapi.h>
+#include "NTPClient.h"
+#include "AutoAimPerformer.h"
 
-static bool g_RenderdocMode = false;
+static bool g_RenderdocMode = true;
 extern bool g_DebugMode = false;
 
 extern std::wstring g_HookedProcessName = L"";
@@ -29,8 +31,10 @@ extern HMODULE hD3D11 = 0;
 extern HMODULE hCurrentModule = 0;
 extern HMODULE hRenderdoc = 0;
 extern HMODULE hDXGI = 0;
+extern WORD g_ShootKey = VK_MBUTTON;
 
 std::vector<DetourHookInfo> sDetourHooks;
+
 
 // // 保证 Renderdoc 始终调用真正的 d3d11 API
 static FARPROC WINAPI Hooked_GetProcAddress(_In_ HMODULE hModule, _In_ LPCSTR lpProcName)
@@ -87,27 +91,6 @@ static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext);
 static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext,
 												 UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation);
 
-static size_t FindPrevCall(uint8_t* pRetAddr, csh handle)
-{
-	for (size_t callInstSize = 1; callInstSize <= 16; ++callInstSize)
-	{
-		const uint8_t* pCode = (uint8_t*)pRetAddr - callInstSize;
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, pCode, callInstSize, (uint64_t)pCode, 0, &pInstructions);
-		if (count == 1 && pInstructions[0].size == callInstSize &&
-			strcmp(pInstructions[0].mnemonic, "call") == 0)
-		{
-			g_Logger->info("++ find call/jmp instruction before retAddr: ");
-			LogInstructionDetail(spdlog::level::info, &pInstructions[0]);
-			cs_free(pInstructions, count);
-			return callInstSize;
-		}
-		cs_free(pInstructions, count);
-	}
-
-	return 0;	// not found.
-}
-
 static void LogInstructions(uint8_t* pAddr, csh handle)
 {
 	cs_insn* pInstructions;
@@ -120,184 +103,8 @@ static void LogInstructions(uint8_t* pAddr, csh handle)
 	}
 }
 
-std::set<void*> DrawIndexedRetAddr;
-std::set<void*> DrawIndexedTailJmps;
-static uint8_t* DetourCaller(csh* pHandle, uint8_t* pCaller, size_t callInstSize, bool tailJmp)
-{
-	csh handle;
-	if (pHandle == NULL)
-	{
-		cs_err err = cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
-		if (err != CS_ERR_OK)
-		{
-			g_Logger->error("Capstone initialize failed {}", err);
-			return NULL;
-		}
-	}
-	else
-	{
-		handle = *pHandle;
-	}
-	
-	uint8_t* pTrampoline;
-	do { // allocate trampoline
-		size_t trampolineSize = 64;
-		size_t delta;
-		pTrampoline = (uint8_t*)PLH::Tools::AllocateWithin2GB(pCaller, trampolineSize, delta);
-		if (pTrampoline == NULL)
-		{
-			g_Logger->error("Diff between pCaller({}) and Hooked_DrawIndexed({}) is too long, "
-							"and attempt to allocate within 2GB failed",
-							(void*)pCaller, (void*)&Hooked_DrawIndexed);
-
-			return NULL;
-		}
-
-		DWORD oldProtection;
-		VirtualProtect(pTrampoline, trampolineSize, PAGE_EXECUTE_READWRITE, &oldProtection);
-
-		uint8_t detour[] = {
-			0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
-			0xFF, 0x15, 0xF2, 0xFF, 0xFF, 0xFF,			// call hooked function
-			0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-			0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
-			0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,			// jmp back to original function
-			0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
-		};
-
-		if (tailJmp)
-			detour[9] = 0x25; // change 'call' to 'jmp'
-
-		memcpy(pTrampoline, detour, sizeof(detour));
-		*(uintptr_t*)&pTrampoline[0] = (uintptr_t)&Hooked_DrawIndexed;
-
-		if (!tailJmp)
-			DrawIndexedRetAddr.insert(pTrampoline + 14);
-		else
-			DrawIndexedTailJmps.insert(pCaller);
-// 		VirtualProtect(pTrampoline, trampolineSize, oldProtection, &oldProtection);
-	} while (0);
-
-
-	do { // log call/jmp instruction
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, pCaller, callInstSize, (uint64_t)pCaller, 0, &pInstructions);
-		g_Logger->info("++ detour call/jmp instruction: ");
-		LogInstructionDetail(spdlog::level::info, &pInstructions[0]);
-		cs_free(pInstructions, count);
-	} while (0);
-
-
-	uint8_t jmpCode[] = { 0xE9, 0x00, 0x00, 0x00, 0x00 };
-	const size_t jmpCodeLen = sizeof(jmpCode);
-
-	// patch relative address of jmp to trampoline
-	*(int32_t*)&jmpCode[1] = (int32_t)((pTrampoline + 8) - (pCaller + jmpCodeLen));
-
-	uint8_t* pRetAddr = pCaller + callInstSize;
-
-	size_t relocSrcSize = 0;
-	if (jmpCodeLen > callInstSize)
-	{ // relocate rest affected code
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, (uint8_t*)pRetAddr,
-									(jmpCodeLen - callInstSize) + 16,
-									(uint64_t)pRetAddr, 0, &pInstructions);
-
-		g_Logger->info(tailJmp ? "++ override instructions" : "++ relocating instructions:");
-		for (size_t i = 0; i < count; ++i)
-		{
-			relocSrcSize += pInstructions[i].size;
-			LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
-			if ((relocSrcSize + callInstSize) >= jmpCodeLen)
-			{
-				memcpy(pTrampoline + 14, pRetAddr, relocSrcSize);
-
-				// TODO relocate these code
-				break;
-			}
-		}
-
-		cs_free(pInstructions, count);
-	}
-
-	size_t hookSrcLen = callInstSize + relocSrcSize;
-
-	// patch trampoline return address
-	*(uintptr_t*)&pTrampoline[36] = (uintptr_t)pRetAddr + relocSrcSize;
-
-	do { // change original function call
-		DWORD oldProtection;
-
-		MEMORY_BASIC_INFORMATION bi;
-		size_t queryRes = VirtualQuery(pCaller, &bi, sizeof(MEMORY_BASIC_INFORMATION));
-		g_Logger->info("VQ: {} {} {} {} {} {} {} {}", queryRes, bi.BaseAddress, bi.AllocationBase, 
-					   bi.AllocationProtect, bi.RegionSize, bi.State, bi.Protect, bi.Type);
-
-		BOOL b = VirtualProtect(pCaller, hookSrcLen, PAGE_READONLY, &oldProtection);
-
-		g_Logger->info("{} {} {} {} {}", hookSrcLen, jmpCodeLen, b, oldProtection, GetLastError());
-		memcpy(pCaller, jmpCode, jmpCodeLen);
-		g_Logger->info("1");
-
-		// fill with nop
-		for (size_t rest = jmpCodeLen; rest < hookSrcLen; ++rest)
-			pCaller[rest] = 0x90;
-		g_Logger->info("1");
-
-		VirtualProtect(pCaller, callInstSize, oldProtection, &oldProtection);
-	} while (0);
-
-	{ // log modified instructions
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, pCaller, hookSrcLen, (uint64_t)pCaller, 0, &pInstructions);
-		g_Logger->info("++ modified call instructions: ");
-		for (size_t i = 0; i < count; ++i)
-			LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
-		cs_free(pInstructions, count);
-	}
-
-	{ // log trampoline instructions
-		cs_insn* pInstructions;
-		size_t count = cs_disasm(handle, pTrampoline + 8, tailJmp ? 6 : 28, 
-								 (uint64_t)pTrampoline + 8, 0, &pInstructions);
-		g_Logger->info("++ generated trampoline instructions: ");
-		for (size_t i = 0; i < count; ++i)
-			LogInstructionDetail(spdlog::level::info, &pInstructions[i]);
-		cs_free(pInstructions, count);
-	}
-
-	return pTrampoline;
-}
-
-static void DetourDrawIndexedRetAddr(void** ppRetAddr)
-{
-	void* pRetAddr = *ppRetAddr;
-
-	csh handle;
-	cs_err err = cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
-	if (err != CS_ERR_OK)
-	{
-		g_Logger->error("Capstone initialize failed {}", err);
-		return;
-	}
-
-	// find last call instruction
-	size_t callInstSize = FindPrevCall((uint8_t*)pRetAddr, handle);
-	if (callInstSize <= 0)
-	{
-		g_Logger->error("DrawIndexed: can't find call instruction before retAddr");
-		return;
-	}
-
-	uint8_t* pPrevCall = (uint8_t*)pRetAddr - callInstSize;
-	uint8_t* pTrampoline = DetourCaller(&handle, pPrevCall, callInstSize, false);
-
-	if (pTrampoline)
-		*ppRetAddr = pTrampoline + 14;
-}
-
 static AutoAimAnalyzer* g_AutoAimAnalyzer;
+static AutoAimPerformer* g_AutoAimPerformer;
 struct KeyState 
 {
 	enum {
@@ -418,39 +225,32 @@ struct SD3D11DeviceAddOn
 		return pRTV;
 	}
 
-	void SetCursorPosF(HWND hwnd, float x, float y)
-	{
-		RECT wndRect;
-		GetWindowRect(hwnd, &wndRect);
-
-// 		POINT targetPt;
-// 		targetPt.x = (LONG) ((wndRect.right - wndRect.left) * x);
-// 		targetPt.y = (LONG) ((wndRect.bottom - wndRect.top) * y);
-// 
-// 		ClientToScreen(hwnd, &targetPt);
-// 
-// 		POINT mousePt;
-// 		GetCursorPos(&mousePt);
-
-		INPUT mouseMove;
-		mouseMove.type = INPUT_MOUSE;
-		mouseMove.mi.dx = (LONG) ((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
-		mouseMove.mi.dy = (LONG)((y - 0.5f) * (wndRect.bottom - wndRect.top)); // targetPt.y - mousePt.y;
-		mouseMove.mi.mouseData = 0;
-		mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
-		mouseMove.mi.time = 0;
-		mouseMove.mi.dwExtraInfo = NULL;
-		SendInput(1, &mouseMove, sizeof(INPUT));
-	}
-
 	void OnRenderEnd(ID3D11RenderTargetView* pRTV, HWND OutputWnd)
 	{
+		static bool dotShootMode = true;
+		static KeyState _0KeyState('0');
+		static KeyState _9KeyState('9');
+		if (_0KeyState.update() == KeyState::KEY_DOWN)
+		{
+			dotShootMode = true;
+			printf("MCCREE mode\n");
+		}
+
+		if (_9KeyState.update() == KeyState::KEY_DOWN)
+		{
+			dotShootMode = false;
+			printf("Soldier_76 mode\n");
+		}
+
 		rdcboost::SDeviceContextState contextState;
 		contextState.GetFromContext(pContext, NULL);
 
-		const std::vector<Vec2>* pResult = NULL;
+		const std::vector<AutoAimAnalyzer::SAimResult>* pResult = NULL;
 		if (g_AutoAimAnalyzer != NULL)
 		{
+			const float minRatio = 0.7f, maxRatio = 0.9f;
+
+			g_AutoAimAnalyzer->SetShootPosRatio(0.7f);
 			g_AutoAimAnalyzer->OnFrameEnd();
 			pResult = &g_AutoAimAnalyzer->GetResult();
 		}
@@ -467,119 +267,98 @@ struct SD3D11DeviceAddOn
 			BackBufferHeight = BackBufferDesc.Height;
 		}
 
-		static KeyState lKeyState(VK_MBUTTON);
-		if (lKeyState.update() == KeyState::KEY_DOWN)
-		{
-			INPUT mouseMove;
-			mouseMove.type = INPUT_MOUSE;
-			mouseMove.mi.dx = 2250;// (LONG)((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
-			mouseMove.mi.dy = 0;
-			mouseMove.mi.mouseData = 0;
-			mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
-			mouseMove.mi.time = 0;
-			mouseMove.mi.dwExtraInfo = NULL;
-			SendInput(1, &mouseMove, sizeof(INPUT));
-		}
+// 		static KeyState middleKeyState(VK_MBUTTON);
+// 		if (middleKeyState.update() == KeyState::KEY_DOWN)
+// 		{
+// 			INPUT mouseMove;
+// 			mouseMove.type = INPUT_MOUSE;
+// 			mouseMove.mi.dx = 2250;// (LONG)((x - 0.5f) * (wndRect.right - wndRect.left));// targetPt.x - mousePt.x;
+// 			mouseMove.mi.dy = 0;
+// 			mouseMove.mi.mouseData = 0;
+// 			mouseMove.mi.dwFlags = MOUSEEVENTF_MOVE;
+// 			mouseMove.mi.time = 0;
+// 			mouseMove.mi.dwExtraInfo = NULL;
+// 			SendInput(1, &mouseMove, sizeof(INPUT));
+// 		}
 
-		static int skipState = 0;
 		static KeyState fKeyState('F');
 		static int aimbotState = 0;
 		if (fKeyState.update() == KeyState::KEY_DOWN)
 		{
 			aimbotState = (aimbotState + 1) % 2;
+			printf("AIMBOT: %s\n", aimbotState ? "ON" : "OFF");
 		}
-		
-		static int lButtonFrames = 0;
-		bool enableAimbot;
-		if (aimbotState == 0)
+
+		bool enableAimbot = false;
+		if (dotShootMode)
 		{
-			enableAimbot = false;
-			lButtonFrames = 0;
+			if (aimbotState != 0)
+			{
+				const int INVALID_AIM_FRAMES = -1000;
+				static KeyState leftKeyState(VK_LBUTTON);
+				static int aimFrames = INVALID_AIM_FRAMES;
+				int lbuttonState = leftKeyState.update();
+				if (lbuttonState == KeyState::KEY_DOWN)
+				{
+					if (aimFrames == INVALID_AIM_FRAMES)
+						aimFrames = 6;
+				}
+
+				if (aimFrames > 0)
+				{
+					enableAimbot = true;
+					--aimFrames;
+				}
+				else if (aimFrames == 0)
+				{
+					INPUT shootDown;
+					shootDown.type = INPUT_MOUSE;
+					memset(&shootDown.mi, 0, sizeof(shootDown.mi));
+					shootDown.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN;
+					SendInput(1, &shootDown, sizeof(INPUT));
+					--aimFrames;
+				}
+
+				if (lbuttonState == KeyState::KEY_UP && aimFrames == -1)
+				{
+					INPUT shootDown;
+					shootDown.type = INPUT_MOUSE;
+					memset(&shootDown.mi, 0, sizeof(shootDown.mi));
+					shootDown.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+					SendInput(1, &shootDown, sizeof(INPUT));
+					aimFrames = INVALID_AIM_FRAMES;
+				}
+			}
 		}
 		else
 		{
-			if (GetAsyncKeyState(VK_LBUTTON) != 0)
-				lButtonFrames = 30;
+			static int lButtonFrames = 0;
+			if (aimbotState == 0)
+			{
+				lButtonFrames = 0;
+			}
 			else
-				--lButtonFrames;
+			{
+				if (GetAsyncKeyState(VK_LBUTTON) != 0)
+					lButtonFrames = 30;
+				else
+					--lButtonFrames;
 
-			enableAimbot = lButtonFrames > 0;
+				enableAimbot = lButtonFrames > 0;
+			}
 		}
 		
-		bool setCursor = false;
 		if (pResult && !pResult->empty() && aimbotState != 0)
 		{
-			float minDistToCenter = FLT_MAX;
-			Vec2 targetPos, targetTex;
+			if (g_AutoAimPerformer == NULL)
+				g_AutoAimPerformer = new AutoAimPerformer;
 
-			RECT wndRect;
-			GetClientRect(OutputWnd, &wndRect);
-			UINT wndWidth = (wndRect.right - wndRect.left);
-			UINT wndHeight = (wndRect.bottom - wndRect.top);
-			for (auto it = pResult->begin(); it != pResult->end(); ++it)
-			{
-				Vec2 point = { it->x * wndWidth, it->y * wndHeight, };
-				float dist = sqrt(pow(point.x - wndWidth / 2.0f, 2.0f) + 
-								  pow(point.y - wndHeight / 2.0f, 2.0f));
-
-				if (minDistToCenter > dist)
-				{
-					minDistToCenter = dist;
-					targetPos = point;
-					targetTex = *it;
-				}
-			}
-
-			{
-				const float nearToY = 1.41411f;
-				const float xToY = 16.0f / 9.0f;
-				if (enableAimbot && minDistToCenter < 100.0f && minDistToCenter >= 5.0f)
-				{
-					Vec2 vec;
-					vec.x = targetPos.x - wndWidth / 2.0f;
-					vec.y = targetPos.y - wndHeight / 2.0f;
-					vec.x /= minDistToCenter;
-					vec.y /= minDistToCenter; // normalized vec
-
-					Vec3 viewPos;
-					viewPos.x = (targetTex.x * 2.0f - 1.0f) * xToY;
-					viewPos.y = (1.0f - targetTex.y) * 2.0f - 1.0f;
-					viewPos.z = nearToY;
-
-					float rayLen = sqrt(viewPos.x * viewPos.x + viewPos.y * viewPos.y + viewPos.z * viewPos.z);
-					viewPos.x /= rayLen;
-					viewPos.y /= rayLen;
-					viewPos.z /= rayLen;
-
-					float dotZAxis = viewPos.z; // dot(viewPos, float3(0, 0, 1))
-					float deltaAngle = acos(dotZAxis);
-
-					float speed = 6.6666f;
-					vec.x *= deltaAngle / 3.1415926f * 180.0f * speed;
-					vec.y *= deltaAngle / 3.1415926f * 180.0f * speed;
-
-					vec.x += wndWidth / 2.0f;
-					vec.y += wndHeight / 2.0f; // convert from vector to point
-
-					if (!(skipState == 1 || skipState == 2))
-					{
-						SetCursorPosF(OutputWnd, vec.x / wndWidth, vec.y / wndHeight);
-					}
-					setCursor = true;
-				}
-			}
-
-			if (setCursor)
-			{
-				++skipState;
-			}
-			else
-			{
-				skipState = 0;
-			}
+			g_AutoAimPerformer->SetOutputWnd(OutputWnd);
+			size_t selectedId = g_AutoAimPerformer->ProcessResults(enableAimbot, pResult);
 
 			pContext->ClearState();
 
+			enum { MAX_RESULT_SIZE = 64 };
 			D3D11_MAPPED_SUBRESOURCE subres;
 			HRESULT res = pContext->Map(pCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &subres);
 			if (SUCCEEDED(res))
@@ -588,15 +367,21 @@ struct SD3D11DeviceAddOn
 				size_t idx = 0;
 				for (auto it = pResult->begin(); it != pResult->end(); ++it, ++idx)
 				{
-					if (idx * 16 >= CBSize)
+					if (idx >= MAX_RESULT_SIZE)
 					{
 						g_Logger->error("Too many result found by AutoAim");
 						break;
 					}
 
-					((float*)subres.pData)[idx * 4 + 0] = it->x;
-					((float*)subres.pData)[idx * 4 + 1] = it->y;
+					((float*)subres.pData)[idx * 4 + 0] = it->onScreenPos.x;
+					((float*)subres.pData)[idx * 4 + 1] = it->onScreenPos.y;
 				}
+
+				((float*)subres.pData)[MAX_RESULT_SIZE * 4 + 0] = 5.0f; // triangle size
+				((float*)subres.pData)[MAX_RESULT_SIZE * 4 + 1] = (float) BackBufferWidth; 
+				((float*)subres.pData)[MAX_RESULT_SIZE * 4 + 2] = (float) BackBufferHeight;
+				((uint32_t*)subres.pData)[MAX_RESULT_SIZE * 4 + 3] = (uint32_t)selectedId;
+
 				pContext->Unmap(pCB, 0);
 			}
 			else
@@ -606,6 +391,7 @@ struct SD3D11DeviceAddOn
 			
 			pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 			pContext->VSSetConstantBuffers(0, 1, &pCB);
+			pContext->PSSetConstantBuffers(0, 1, &pCB);
 			pContext->VSSetShader(pVSDrawTarget, NULL, 0);
 
 			D3D11_VIEWPORT viewport;
@@ -619,7 +405,9 @@ struct SD3D11DeviceAddOn
 			pContext->RSSetState(pRS);
 			pContext->PSSetShader(pPSDrawTarget, NULL, 0);
 			pContext->OMSetRenderTargets(1, &pRTV, NULL);
-			pContext->Draw((UINT)pResult->size() * 3, 0);
+
+			if (!dotShootMode)
+				pContext->Draw((UINT)pResult->size() * 3, 0);
 
 		}
 		contextState.SetToContext(pContext);
@@ -645,13 +433,64 @@ std::map<ID3D11Device*, SD3D11DeviceAddOn*> g_D3D11AddonDatas;
 static void STDMETHODCALLTYPE Hooked_Draw(ID3D11DeviceContext* pContext,
 										  UINT VertexCount, UINT StartVertexLocation)
 {
-	tDraw pfnOriginal = (tDraw)g_DrawHook->GetOriginalPtr(pContext);
-	pfnOriginal(pContext, VertexCount, StartVertexLocation);
+	if (g_DebugMode || g_HookedProcessName.find(L"overwatch.exe") != std::wstring::npos)
+	{
+		if (VertexCount == 144)
+		{
+			UINT stencilRef;
+			ID3D11DepthStencilState* pDepthStencilState;
+			pContext->OMGetDepthStencilState(&pDepthStencilState, &stencilRef);
+
+			if (pDepthStencilState != NULL)
+			{
+				D3D11_DEPTH_STENCIL_DESC dsDesc;
+				pDepthStencilState->GetDesc(&dsDesc);
+				D3D11_DEPTH_STENCIL_DESC targetDSDesc;
+				targetDSDesc.DepthEnable = TRUE;
+				targetDSDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+				targetDSDesc.DepthFunc = D3D11_COMPARISON_LESS;
+				targetDSDesc.StencilEnable = TRUE;
+				targetDSDesc.StencilWriteMask = 1;
+				targetDSDesc.StencilReadMask = 1;
+				targetDSDesc.FrontFace.StencilFunc = D3D11_COMPARISON_LESS;
+				targetDSDesc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_ZERO;
+				targetDSDesc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_ZERO;
+				targetDSDesc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_ZERO;
+				targetDSDesc.BackFace.StencilFunc = D3D11_COMPARISON_LESS_EQUAL;
+				targetDSDesc.BackFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+				targetDSDesc.BackFace.StencilDepthFailOp = D3D11_STENCIL_OP_INCR_SAT;
+				targetDSDesc.BackFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
+				if (memcmp(&dsDesc, &targetDSDesc, sizeof(D3D11_DEPTH_STENCIL_DESC)) == 0 && stencilRef == 0)
+				{
+					if (g_AutoAimAnalyzer == NULL)
+						g_AutoAimAnalyzer = new AutoAimAnalyzer(pContext);
+
+					g_AutoAimAnalyzer->OnDrawAllyArrow(VertexCount, StartVertexLocation);
+				}
+				SAFE_RELEASE(pDepthStencilState);
+			}
+		}
+	}
+	
+	tDraw pfnOriginal = (tDraw)g_DrawHook->BeginInvokeOriginal(pContext);
+	if (pfnOriginal != NULL)
+	{
+		pfnOriginal(pContext, VertexCount, StartVertexLocation);
+		g_DrawHook->EndInvokeOriginal(pfnOriginal);
+	}
+	else
+	{
+		g_Logger->critical("no original Draw functions {} {}", (void*)pContext,
+						   (void*)g_DrawHook->GetVTableFuncPtr(pContext));
+	}
+
 }
 
 static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext, 
 		UINT IndexCount, UINT StartIndexLocation, INT BaseVertexLocation)
 {
+	static int i = 0;
+// 	printf("Hooked_DrawIndexed(%06d %03d)\n", i++, GetCurrentThreadId());
 	bool changedDS = false;
 	UINT stencilRef = 0;
 	ID3D11DepthStencilState* pDepthStencilState = NULL;
@@ -716,10 +555,11 @@ static void STDMETHODCALLTYPE Hooked_DrawIndexed(ID3D11DeviceContext* pContext,
 		}
 	}
 	
-	tDrawIndexed pfnOriginal = (tDrawIndexed) g_DrawIndexedHook->GetOriginalPtr(pContext);
+	tDrawIndexed pfnOriginal = (tDrawIndexed) g_DrawIndexedHook->BeginInvokeOriginal(pContext);
 	if (pfnOriginal != NULL)
 	{
 		pfnOriginal(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+		g_DrawIndexedHook->EndInvokeOriginal(pfnOriginal);
 	}
 	else
 	{
@@ -744,8 +584,7 @@ static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext)
 	{
 		const int DrawIndexed_VTABLE_INDEX = 12;
 		g_DrawIndexedHook = new VTableHook(DrawIndexed_VTABLE_INDEX, &Hooked_DrawIndexed,
-										   "ID3D11DeviceContext::DrawIndexed(UINT, UINT, UINT)",
-										   32);
+										   "ID3D11DeviceContext::DrawIndexed(UINT, UINT, UINT)", 32);
 	}
 
 	g_DrawIndexedHook->HookObject(pContext);
@@ -763,6 +602,9 @@ static void HookD3D11DeviceContext(ID3D11DeviceContext* pContext)
 static void HookD3D11Device(ID3D11Device** ppDevice)
 {
 	if (ppDevice == NULL || *ppDevice == NULL)
+		return;
+
+	if (g_D3D11AddonDatas.find(*ppDevice) != g_D3D11AddonDatas.end())
 		return;
 
 	g_D3D11AddonDatas[*ppDevice] = new SD3D11DeviceAddOn(*ppDevice);
@@ -794,6 +636,8 @@ HRESULT WINAPI CreateDerivedD3D11DeviceAndSwapChain(
 	_Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel,
 	_Out_opt_ ID3D11DeviceContext** ppImmediateContext)
 {
+// 	GetTimeFromNTPServer();
+
 	g_Logger->info("{:*^50}", "D3D11CreateDeviceAndSwapChain");
 	g_Logger->info("pAdater: {}", (void*) pAdapter);
 	g_Logger->info("DriverType: {}", (UINT)DriverType);
@@ -897,10 +741,12 @@ static HRESULT STDMETHODCALLTYPE Hooked_Present(
 		g_Logger->error("GetDevice from swapchain failed {}", (void*)pSwapChain);
 	}
 
-	tPresent pfn = (tPresent)g_SwapChain_PresentHook->GetOriginalPtr(pSwapChain);
+	tPresent pfn = (tPresent)g_SwapChain_PresentHook->BeginInvokeOriginal(pSwapChain);
 	if (pfn != NULL)
 	{
-		return pfn(pSwapChain, SyncInterval, Flags);
+		HRESULT res = pfn(pSwapChain, SyncInterval, Flags);
+		g_SwapChain_PresentHook->EndInvokeOriginal(pfn);
+		return res;
 	}
 	else
 	{
@@ -931,12 +777,13 @@ static HRESULT STDMETHODCALLTYPE Hooked_CreateSwapChain(
 	DXGI_SWAP_CHAIN_DESC *pDesc, IDXGISwapChain **ppSwapChain)
 {
 	g_Logger->debug("IDXGIFactory::CreateSwapChain");
-	tCreateSwapChain pfn = (tCreateSwapChain)g_DXGIFactory_CreateSwapChainHook->GetOriginalPtr(pFactory);
+	tCreateSwapChain pfn = (tCreateSwapChain)g_DXGIFactory_CreateSwapChainHook->BeginInvokeOriginal(pFactory);
 
 	HRESULT res;
 	if (pfn != NULL)
 	{
 		res = pfn(pFactory, pDevice, pDesc, ppSwapChain);
+		g_DXGIFactory_CreateSwapChainHook->EndInvokeOriginal(pfn);
 	}
 	else
 	{
@@ -955,6 +802,7 @@ static HRESULT STDMETHODCALLTYPE Hooked_CreateSwapChain(
 		}
 		else
 		{
+			HookD3D11Device(&pD3D11Device);
 			g_D3D11AddonDatas[pD3D11Device]->AddSwapChain(*ppSwapChain);
 			SAFE_RELEASE(pD3D11Device);
 
@@ -1061,8 +909,36 @@ void initGlobalLog()
 // }
 // 
 
+static BOOL WINAPI Hooked_VirtualProtect(
+	_In_  LPVOID lpAddress,
+	_In_  SIZE_T dwSize,
+	_In_  DWORD  flNewProtect,
+	_Out_ PDWORD lpflOldProtect
+	)
+{
+
+}
+
+
+static BOOL WINAPI Hooked_VirtualProtectEx(
+	_In_  HANDLE hProcess,
+	_In_  LPVOID lpAddress,
+	_In_  SIZE_T dwSize,
+	_In_  DWORD  flNewProtect,
+	_Out_ PDWORD lpflOldProtect
+	)
+{
+
+}
+
+
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 bool InitD3D11AndRenderdoc(HMODULE currentModule)
 {
+	AllocConsole();
+	freopen("CONOUT$", "wt", stdout);
+	freopen("CONIN$", "rt", stdin);
+
 	initGlobalLog();
 
 	// 	csh handle;
@@ -1135,8 +1011,21 @@ bool InitD3D11AndRenderdoc(HMODULE currentModule)
 		hRenderdoc = LoadLibrary(L"renderdoc.dll");
 		if (hRenderdoc == NULL)
 		{
-			g_Logger->error("load renderdoc.dll failed.\n");
-			return false;
+			g_Logger->error("not found renderdoc.dll, try searching renderdoc.dll in DllPath.");
+			WCHAR DllPath[MAX_PATH] = { 0 };
+			GetModuleFileNameW((HINSTANCE)&__ImageBase, DllPath, _countof(DllPath));
+			std::wstring currDllPath(DllPath);
+
+			std::wstring renderdocDllPath = 
+				currDllPath.substr(0, currDllPath.find_last_of(L"/\\") + 1) + L"renderdoc.dll";
+
+			hRenderdoc = LoadLibrary(renderdocDllPath.c_str());
+
+			if (hRenderdoc == NULL)
+			{
+				g_Logger->error("load renderdoc.dll failed.\n");
+				return false;
+			}
 		}
 	}
 

@@ -20,5 +20,16 @@ x86_reg GetUnifiedReg(cs_x86* x86, int regId);
 
 void LogInstructionDetail(spdlog::level::level_enum level, cs_insn* pInsn);
 
-bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize,
-						 uint8_t** ppRestoreCode, uint32_t* pRestoreCodeSize);
+
+struct PrologueJmpPatch
+{
+	uint64_t* jmpTargetAddr;
+	uint64_t  oldJmpTarget;
+	uint64_t  newJmpTarget;
+
+	PrologueJmpPatch() : oldJmpTarget(0), newJmpTarget(0), jmpTargetAddr(NULL) {}
+};
+
+bool GenerateRestoreCode(uint8_t* pFuncAddr, int codeSize, uint8_t* jmpAddrAfterRestore,
+						 uint8_t** ppRestoreCode, uint32_t* pRestoreCodeSize, 
+						 PrologueJmpPatch* jmpPatch);
